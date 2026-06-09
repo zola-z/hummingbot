@@ -2,8 +2,6 @@ import json
 import re
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-from typing import Any, Dict
-from unittest.mock import patch
 
 from aioresponses.core import aioresponses
 from bidict import bidict
