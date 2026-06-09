@@ -1,4 +1,5 @@
-from typing import Any, Callable, Dict, Optional
+import time
+from typing import Callable, Optional
 
 import hummingbot.connector.derivative.msx_perpetual.msx_perpetual_constants as CONSTANTS
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
@@ -15,24 +16,27 @@ class MsxPerpetualRESTPreProcessor(RESTPreProcessorBase):
     async def pre_process(self, request: RESTRequest) -> RESTRequest:
         if request.headers is None:
             request.headers = {}
+        # MSX: POST 用 JSON; GET 无 body。保留 binance 风格便于复用测试。
         request.headers["Content-Type"] = (
             "application/json" if request.method == RESTMethod.POST else "application/x-www-form-urlencoded"
         )
         return request
 
 
-def public_rest_url(path_url: str, domain: str = "msx_perpetual"):
-    base_url = CONSTANTS.PERPETUAL_BASE_URL if domain == "msx_perpetual" else CONSTANTS.TESTNET_BASE_URL
-    return base_url + path_url
+def _base_url(domain: str) -> str:
+    return CONSTANTS.PERPETUAL_BASE_URL if domain == CONSTANTS.DOMAIN else CONSTANTS.TESTNET_BASE_URL
 
 
-def private_rest_url(path_url: str, domain: str = "msx_perpetual"):
-    base_url = CONSTANTS.PERPETUAL_BASE_URL if domain == "msx_perpetual" else CONSTANTS.TESTNET_BASE_URL
-    return base_url + path_url
+def public_rest_url(path_url: str, domain: str = CONSTANTS.DOMAIN) -> str:
+    return _base_url(domain) + path_url
 
 
-def wss_url(endpoint: str, domain: str = "msx_perpetual"):
-    base_ws_url = CONSTANTS.PERPETUAL_WS_URL if domain == "msx_perpetual" else CONSTANTS.TESTNET_WS_URL
+def private_rest_url(path_url: str, domain: str = CONSTANTS.DOMAIN) -> str:
+    return _base_url(domain) + path_url
+
+
+def wss_url(endpoint: str = "", domain: str = CONSTANTS.DOMAIN) -> str:
+    base_ws_url = CONSTANTS.PERPETUAL_WS_URL if domain == CONSTANTS.DOMAIN else CONSTANTS.TESTNET_WS_URL
     return base_ws_url + endpoint
 
 
@@ -44,10 +48,8 @@ def build_api_factory(
         auth: Optional[AuthBase] = None) -> WebAssistantsFactory:
     throttler = throttler or create_throttler()
     time_synchronizer = time_synchronizer or TimeSynchronizer()
-    time_provider = time_provider or (lambda: get_current_server_time(
-        throttler=throttler,
-        domain=domain,
-    ))
+    # MSX 无 server time 端点; 用本地时间(签名容差 ±30s)。
+    time_provider = time_provider or (lambda: get_current_server_time(throttler=throttler, domain=domain))
     api_factory = WebAssistantsFactory(
         throttler=throttler,
         auth=auth,
@@ -73,28 +75,5 @@ async def get_current_server_time(
         throttler: Optional[AsyncThrottler] = None,
         domain: str = CONSTANTS.DOMAIN,
 ) -> float:
-    throttler = throttler or create_throttler()
-    api_factory = build_api_factory_without_time_synchronizer_pre_processor(throttler=throttler)
-    rest_assistant = await api_factory.get_rest_assistant()
-    response = await rest_assistant.execute_request(
-        url=public_rest_url(path_url=CONSTANTS.SERVER_TIME_PATH_URL, domain=domain),
-        method=RESTMethod.GET,
-        throttler_limit_id=CONSTANTS.SERVER_TIME_PATH_URL,
-    )
-    server_time = response["serverTime"]
-    return server_time
-
-
-def is_exchange_information_valid(rule: Dict[str, Any]) -> bool:
-    """
-    Verifies if a trading pair is enabled to operate with based on its exchange information
-
-    :param exchange_info: the exchange information for a trading pair
-
-    :return: True if the trading pair is enabled, False otherwise
-    """
-    if rule["contractType"] in ("PERPETUAL", "TRADIFI_PERPETUAL") and rule["status"] == "TRADING":
-        valid = True
-    else:
-        valid = False
-    return valid
+    # MSX 未提供服务器时间端点; 直接返回本地毫秒时间(签名容差 ±30s 足够)。
+    return time.time() * 1e3
