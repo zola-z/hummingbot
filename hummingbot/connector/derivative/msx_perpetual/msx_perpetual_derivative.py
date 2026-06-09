@@ -1,14 +1,14 @@
 import asyncio
 import time
-from collections import defaultdict
 from decimal import Decimal
-from typing import Any, AsyncIterable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
 from hummingbot.connector.derivative.msx_perpetual import (
     msx_perpetual_constants as CONSTANTS,
+    msx_perpetual_utils as utils,
     msx_perpetual_web_utils as web_utils,
 )
 from hummingbot.connector.derivative.msx_perpetual.msx_perpetual_api_order_book_data_source import (
@@ -21,18 +21,33 @@ from hummingbot.connector.derivative.msx_perpetual.msx_perpetual_user_stream_dat
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.api_throttler.data_types import RateLimit
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
+from hummingbot.core.data_type.trade_fee import TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_gather
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 bpm_logger = None
+
+# MSX-specific design decisions (see docs/connectors/msx-api-notes.md §2, §7):
+#   * No clientOrderId: the exchange identifies orders by a server-assigned int64 ``orderId``.
+#     Hummingbot's client_order_id is tracked locally; exchange_order_id == str(orderId).
+#   * There is no "get single order" endpoint: order status is reconstructed by scanning the
+#     current open orders (/order/limit) then the order history (/order/history) for id==orderId.
+#   * Closing a position needs the position's ``id`` (posId), not a reduce-only reverse order.
+#   * Balances and positions both come from the single POST /position/current object.
+#   * No private user-stream WebSocket; all updates come from REST polling.
+#   * ONEWAY position mode only; leverage is per-order (set locally, no set-leverage endpoint);
+#     no funding endpoint; no exchangeInfo (trading rules built from /price-steps).
+DEFAULT_MIN_AMOUNT_INCREMENT = Decimal("0.00000001")
+DEFAULT_MIN_ORDER_SIZE = Decimal("0.00000001")
+DEFAULT_MIN_NOTIONAL = Decimal("0.00000001")
+DEFAULT_LEVERAGE = 1
 
 
 class MsxPerpetualDerivative(PerpetualDerivativePyBase):
@@ -58,6 +73,9 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         self._domain = domain
         self._position_mode = None
         self._last_trade_history_timestamp = None
+        # Cache of current position ids keyed by (exchange_symbol, PositionSide); used to build
+        # the ``posId`` required when closing a position via /order/create.
+        self._position_id_by_symbol_side: Dict[Tuple[str, PositionSide], int] = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -67,7 +85,7 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
     @property
     def authenticator(self) -> MsxPerpetualAuth:
         return MsxPerpetualAuth(self.msx_perpetual_api_key, self.msx_perpetual_secret_key,
-                                    self._time_synchronizer)
+                                self._time_synchronizer)
 
     @property
     def rate_limits_rules(self) -> List[RateLimit]:
@@ -83,19 +101,22 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
 
     @property
     def client_order_id_prefix(self) -> str:
-        return CONSTANTS.BROKER_ID
+        # MSX has no broker/client-order-id concept; the local client_order_id needs no prefix.
+        return ""
 
     @property
     def trading_rules_request_path(self) -> str:
-        return CONSTANTS.EXCHANGE_INFO_URL
+        # No exchangeInfo endpoint; rules are pulled per pair from /price-steps in _update_trading_rules.
+        return CONSTANTS.PRICE_STEPS_PATH_URL
 
     @property
     def trading_pairs_request_path(self) -> str:
-        return CONSTANTS.EXCHANGE_INFO_URL
+        return CONSTANTS.PRICE_STEPS_PATH_URL
 
     @property
     def check_network_request_path(self) -> str:
-        return CONSTANTS.PING_URL
+        # MSX has no /ping; use the public ticker as a lightweight connectivity probe.
+        return CONSTANTS.TICKER_PATH_URL
 
     @property
     def trading_pairs(self):
@@ -114,16 +135,11 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         return 600
 
     def supported_order_types(self) -> List[OrderType]:
-        """
-        :return a list of OrderType supported by this connector
-        """
-        return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
+        return [OrderType.LIMIT, OrderType.MARKET]
 
-    def supported_position_modes(self):
-        """
-        This method needs to be overridden to provide the accurate information depending on the exchange.
-        """
-        return [PositionMode.ONEWAY, PositionMode.HEDGE]
+    def supported_position_modes(self) -> List[PositionMode]:
+        # MSX documents only cross/isolated margin, with no hedge/one-way dual-side switch.
+        return [PositionMode.ONEWAY]
 
     def get_buy_collateral_token(self, trading_pair: str) -> str:
         trading_rule: TradingRule = self._trading_rules[trading_pair]
@@ -133,21 +149,18 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         trading_rule: TradingRule = self._trading_rules[trading_pair]
         return trading_rule.sell_order_collateral_token
 
-    def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
+    def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
+        # MSX rejects requests outside the ±30s window with HTTP 401; treat that as a clock issue.
         error_description = str(request_exception)
-        is_time_synchronizer_related = ("-1021" in error_description
-                                        and "Timestamp for this request" in error_description)
-        return is_time_synchronizer_related
+        return "401" in error_description and "timestamp" in error_description.lower()
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        return str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in str(
-            status_update_exception
-        ) and CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
+        # _request_order_status raises an IOError tagged with this marker when an order can be found
+        # neither in the open-orders list nor in the order history.
+        return "ORDER_NOT_FOUND" in str(status_update_exception)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        return str(CONSTANTS.UNKNOWN_ORDER_ERROR_CODE) in str(
-            cancelation_exception
-        ) and CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancelation_exception)
+        return "ORDER_NOT_FOUND" in str(cancelation_exception)
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
@@ -195,37 +208,43 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         return fee
 
     async def _update_trading_fees(self):
-        """
-        Update fees information from the exchange
-        """
         pass
 
+    async def _user_stream_event_listener(self):
+        # MSX has no private user-stream WebSocket; the user-stream data source never emits messages,
+        # so this listener is a no-op. Order/balance/position updates come from REST polling.
+        return
+
+    async def check_network(self) -> NetworkStatus:
+        # MSX has no /ping; probe a public ticker for the first configured trading pair.
+        try:
+            trading_pair = (self._trading_pairs or [utils.EXAMPLE_PAIR])[0]
+            symbol = utils.convert_to_exchange_trading_pair(trading_pair)
+            resp = await self._api_get(
+                path_url=CONSTANTS.TICKER_PATH_URL + "/" + symbol,
+                limit_id=CONSTANTS.TICKER_PATH_URL,
+            )
+            if resp.get("code") == CONSTANTS.SUCCESS_CODE:
+                return NetworkStatus.CONNECTED
+            return NetworkStatus.NOT_CONNECTED
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return NetworkStatus.NOT_CONNECTED
+
+    async def _make_network_check_request(self):
+        # check_network() is overridden, so this base hook is unused; keep it harmless.
+        return
+
     async def _status_polling_loop_fetch_updates(self):
+        # MSX has no private user stream; everything is REST polled here.
         await safe_gather(
-            self._update_order_fills_from_trades(),
             self._update_order_status(),
             self._update_balances(),
             self._update_positions(),
         )
 
-    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
-        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
-        api_params = {
-            "origClientOrderId": order_id,
-            "symbol": symbol,
-        }
-        cancel_result = await self._api_delete(
-            path_url=CONSTANTS.ORDER_URL,
-            params=api_params,
-            is_auth_required=True)
-        if cancel_result.get("code") == -2011 and "Unknown order sent." == cancel_result.get("msg", ""):
-            self.logger().debug(f"The order {order_id} does not exist on Binance Perpetuals. "
-                                f"No cancelation needed.")
-            await self._order_tracker.process_order_not_found(order_id)
-            raise IOError(f"{cancel_result.get('code')} - {cancel_result['msg']}")
-        if cancel_result.get("status") == "CANCELED":
-            return True
-        return False
+    # ------------------------------------------------------------------ orders
 
     async def _place_order(
             self,
@@ -238,565 +257,328 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
             position_action: PositionAction = PositionAction.NIL,
             **kwargs,
     ) -> Tuple[str, float]:
-
-        amount_str = f"{amount:f}"
-        price_str = f"{price:f}"
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        api_params = {"symbol": symbol,
-                      "side": "BUY" if trade_type is TradeType.BUY else "SELL",
-                      "quantity": amount_str,
-                      "type": "MARKET" if order_type is OrderType.MARKET else "LIMIT",
-                      "newClientOrderId": order_id
-                      }
+        side = CONSTANTS.SIDE_LONG if trade_type is TradeType.BUY else CONSTANTS.SIDE_SHORT
+        is_close = position_action == PositionAction.CLOSE
+        open_type = CONSTANTS.OPEN_TYPE_CLOSE if is_close else CONSTANTS.OPEN_TYPE_OPEN
+
+        api_params: Dict[str, Any] = {
+            "symbol": symbol,
+            "coType": CONSTANTS.DEFAULT_CO_TYPE,
+            "orderType": CONSTANTS.ORDER_TYPE_MARKET if order_type is OrderType.MARKET else CONSTANTS.ORDER_TYPE_LIMIT,
+            "openType": open_type,
+            "side": side,
+            "vol": f"{amount:f}",
+            "marginMode": CONSTANTS.MARGIN_MODE_CROSS,
+            "triggerType": CONSTANTS.TRIGGER_NORMAL,
+        }
         if order_type.is_limit_type():
-            api_params["price"] = price_str
-        if order_type == OrderType.LIMIT:
-            api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
-        if order_type == OrderType.LIMIT_MAKER:
-            api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTX
-        if self.position_mode == PositionMode.HEDGE:
-            if position_action == PositionAction.OPEN:
-                api_params["positionSide"] = "LONG" if trade_type is TradeType.BUY else "SHORT"
-            else:
-                api_params["positionSide"] = "SHORT" if trade_type is TradeType.BUY else "LONG"
-        try:
-            order_result = await self._api_post(
-                path_url=CONSTANTS.ORDER_URL,
-                data=api_params,
-                is_auth_required=True)
-            o_id = str(order_result["orderId"])
-            transact_time = order_result["updateTime"] * 1e-3
-        except IOError as e:
-            error_description = str(e)
-            is_server_overloaded = ("status is 503" in error_description
-                                    and "Unknown error, please check your request or try again later." in error_description)
-            if is_server_overloaded:
-                o_id = "UNKNOWN"
-                transact_time = time.time()
-            else:
-                raise
+            api_params["price"] = f"{price:f}"
+
+        if is_close:
+            # Closing requires the server-side position id. When closing a LONG we submit a SELL
+            # (side=SHORT) and vice-versa, so the position we close is on the opposite side.
+            pos_side = PositionSide.LONG if trade_type is TradeType.SELL else PositionSide.SHORT
+            pos_id = self._position_id_by_symbol_side.get((symbol, pos_side))
+            if pos_id is None:
+                pos_id = await self._fetch_position_id(symbol, pos_side)
+            if pos_id is None:
+                raise ValueError(
+                    f"Cannot close position for {trading_pair} ({pos_side.name}): no open position id found "
+                    f"on MSX. A posId from /position/current is required to close.")
+            api_params["posId"] = pos_id
+        else:
+            # leverage is mandatory on open; MSX takes it per order (no set-leverage endpoint).
+            api_params["leverage"] = str(self._leverage_for(trading_pair))
+
+        order_result = await self._api_post(
+            path_url=CONSTANTS.ORDER_CREATE_PATH_URL,
+            data=api_params,
+            is_auth_required=True)
+        self._raise_on_error(order_result)
+        data = order_result["data"]
+        o_id = str(data["orderId"])
+        # The create response carries no update timestamp, so use local time.
+        transact_time = time.time()
         return o_id, transact_time
 
+    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
+        exchange_order_id = await tracked_order.get_exchange_order_id()
+        api_params = {"orderId": int(exchange_order_id)}
+        cancel_result = await self._api_post(
+            path_url=CONSTANTS.ORDER_CANCEL_PATH_URL,
+            data=api_params,
+            is_auth_required=True,
+            return_err=True)
+        return cancel_result.get("code") == CONSTANTS.SUCCESS_CODE
+
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
-        trade_updates = []
-        try:
-            exchange_order_id = await order.get_exchange_order_id()
-            trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
-            all_fills_response = await self._api_get(
-                path_url=CONSTANTS.ACCOUNT_TRADE_LIST_URL,
-                params={
-                    "symbol": trading_pair,
-                },
-                is_auth_required=True)
-
-            for trade in all_fills_response:
-                order_id = str(trade.get("orderId"))
-                if order_id == exchange_order_id:
-                    position_side = trade["positionSide"]
-                    position_action = (PositionAction.OPEN
-                                       if (order.trade_type is TradeType.BUY and position_side == "LONG"
-                                           or order.trade_type is TradeType.SELL and position_side == "SHORT")
-                                       else PositionAction.CLOSE)
-                    fee = TradeFeeBase.new_perpetual_fee(
-                        fee_schema=self.trade_fee_schema(),
-                        position_action=position_action,
-                        percent_token=trade["commissionAsset"],
-                        flat_fees=[TokenAmount(amount=Decimal(trade["commission"]), token=trade["commissionAsset"])]
-                    )
-                    trade_update: TradeUpdate = TradeUpdate(
-                        trade_id=str(trade["id"]),
-                        client_order_id=order.client_order_id,
-                        exchange_order_id=trade["orderId"],
-                        trading_pair=order.trading_pair,
-                        fill_timestamp=trade["time"] * 1e-3,
-                        fill_price=Decimal(trade["price"]),
-                        fill_base_amount=Decimal(trade["qty"]),
-                        fill_quote_amount=Decimal(trade["quoteQty"]),
-                        fee=fee,
-                    )
-                    trade_updates.append(trade_update)
-
-        except asyncio.TimeoutError:
-            raise IOError(f"Skipped order update with order fills for {order.client_order_id} "
-                          "- waiting for exchange order id.")
-
-        return trade_updates
+        # MSX exposes fills only through aggregate avgPrice/filledVol on /order/history and
+        # /order/entrust-history (no per-trade fills endpoint). Fills are folded into the
+        # OrderUpdate produced by _request_order_status, so there are no granular trade updates.
+        return []
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
-        order_update = await self._api_get(
-            path_url=CONSTANTS.ORDER_URL,
-            params={
-                "symbol": trading_pair,
-                "origClientOrderId": tracked_order.client_order_id
-            },
-            is_auth_required=True)
-        if "code" in order_update:
-            if self._is_request_exception_related_to_time_synchronizer(request_exception=order_update):
-                _order_update = OrderUpdate(
-                    trading_pair=tracked_order.trading_pair,
-                    update_timestamp=self.current_timestamp,
-                    new_state=tracked_order.current_state,
-                    client_order_id=tracked_order.client_order_id,
-                )
-                return _order_update
-        _order_update: OrderUpdate = OrderUpdate(
+        exchange_order_id = await tracked_order.get_exchange_order_id()
+        target_id = int(exchange_order_id)
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
+
+        # 1) current open orders (status 0/1/3) via /order/limit
+        open_orders = await self._api_post(
+            path_url=CONSTANTS.ORDER_LIMIT_PATH_URL,
+            data={"symbol": symbol, "coType": CONSTANTS.DEFAULT_CO_TYPE},
+            is_auth_required=True,
+            return_err=True)
+        match = self._find_order(open_orders, target_id)
+        if match is None:
+            # 2) order history (status 0..6) via /order/history
+            history = await self._api_post(
+                path_url=CONSTANTS.ORDER_HISTORY_PATH_URL,
+                data={"symbol": symbol, "coType": CONSTANTS.DEFAULT_CO_TYPE},
+                is_auth_required=True,
+                return_err=True)
+            match = self._find_order(history, target_id)
+
+        if match is None:
+            raise IOError(f"ORDER_NOT_FOUND: order {exchange_order_id} not found on MSX.")
+
+        status = int(match["status"])
+        ts_ms = match.get("tradedTime") or match.get("ctime") or self.current_timestamp * 1e3
+        return OrderUpdate(
             trading_pair=tracked_order.trading_pair,
-
-            update_timestamp=order_update["updateTime"] * 1e-3,
-            new_state=CONSTANTS.ORDER_STATE[order_update["status"]],
-            client_order_id=order_update["clientOrderId"],
-            exchange_order_id=order_update["orderId"],
+            update_timestamp=float(ts_ms) * 1e-3,
+            new_state=CONSTANTS.ORDER_STATE[status],
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=str(match["id"]),
         )
-        return _order_update
 
-    async def _iter_user_event_queue(self) -> AsyncIterable[Dict[str, any]]:
-        while True:
-            try:
-                yield await self._user_stream_tracker.user_stream.get()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().network(
-                    "Unknown error. Retrying after 1 seconds.",
-                    exc_info=True,
-                    app_warning_msg="Could not fetch user events from Binance. Check API key and network connection.",
-                )
-                await self._sleep(1.0)
-
-    async def _user_stream_event_listener(self):
-        """
-        Wait for new messages from _user_stream_tracker.user_stream queue and processes them according to their
-        message channels. The respective UserStreamDataSource queues these messages.
-        """
-        async for event_message in self._iter_user_event_queue():
-            try:
-                await self._process_user_stream_event(event_message)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self.logger().error(f"Unexpected error in user stream listener loop: {e}", exc_info=True)
-                await self._sleep(5.0)
-
-    async def _process_user_stream_event(self, event_message: Dict[str, Any]):
-        event_type = event_message.get("e")
-        if event_type == "ORDER_TRADE_UPDATE":
-            order_message = event_message.get("o")
-            client_order_id = order_message.get("c", None)
-            tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
-            if tracked_order is not None:
-                trade_id: str = str(order_message["t"])
-
-                if trade_id != "0":  # Indicates that there has been a trade
-
-                    fee_asset = order_message.get("N", tracked_order.quote_asset)
-                    fee_amount = Decimal(order_message.get("n", "0"))
-                    position_side = order_message.get("ps", "LONG")
-                    position_action = (PositionAction.OPEN
-                                       if (tracked_order.trade_type is TradeType.BUY and position_side == "LONG"
-                                           or tracked_order.trade_type is TradeType.SELL and position_side == "SHORT")
-                                       else PositionAction.CLOSE)
-                    flat_fees = [] if fee_amount == Decimal("0") else [TokenAmount(amount=fee_amount, token=fee_asset)]
-
-                    fee = TradeFeeBase.new_perpetual_fee(
-                        fee_schema=self.trade_fee_schema(),
-                        position_action=position_action,
-                        percent_token=fee_asset,
-                        flat_fees=flat_fees,
-                    )
-
-                    trade_update: TradeUpdate = TradeUpdate(
-                        trade_id=trade_id,
-                        client_order_id=client_order_id,
-                        exchange_order_id=str(order_message["i"]),
-                        trading_pair=tracked_order.trading_pair,
-                        fill_timestamp=order_message["T"] * 1e-3,
-                        fill_price=Decimal(order_message["L"]),
-                        fill_base_amount=Decimal(order_message["l"]),
-                        fill_quote_amount=Decimal(order_message["L"]) * Decimal(order_message["l"]),
-                        fee=fee,
-                    )
-                    self._order_tracker.process_trade_update(trade_update)
-
-            tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
-            if tracked_order is not None:
-                order_update: OrderUpdate = OrderUpdate(
-                    trading_pair=tracked_order.trading_pair,
-                    update_timestamp=event_message["T"] * 1e-3,
-                    new_state=CONSTANTS.ORDER_STATE[order_message["X"]],
-                    client_order_id=client_order_id,
-                    exchange_order_id=str(order_message["i"]),
-                )
-
-                self._order_tracker.process_order_update(order_update)
-
-        elif event_type == "ACCOUNT_UPDATE":
-            update_data = event_message.get("a", {})
-            # update balances
-            for asset in update_data.get("B", []):
-                asset_name = asset["a"]
-                self._account_balances[asset_name] = Decimal(asset["wb"])
-                self._account_available_balances[asset_name] = Decimal(asset["cw"])
-
-            # update position
-            for asset in update_data.get("P", []):
-                trading_pair = asset["s"]
-                try:
-                    hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(trading_pair)
-                except KeyError:
-                    # Ignore results for which their symbols is not tracked by the connector
-                    continue
-
-                side = PositionSide[asset['ps']]
-                position = self._perpetual_trading.get_position(hb_trading_pair, side)
-                if position is not None:
-                    amount = Decimal(asset["pa"])
-                    if amount == Decimal("0"):
-                        pos_key = self._perpetual_trading.position_key(hb_trading_pair, side)
-                        self._perpetual_trading.remove_position(pos_key)
-                    else:
-                        position.update_position(position_side=PositionSide[asset["ps"]],
-                                                 unrealized_pnl=Decimal(asset["up"]),
-                                                 entry_price=Decimal(asset["ep"]),
-                                                 amount=Decimal(asset["pa"]))
+    async def _update_order_status(self):
+        last_tick = int(self._last_poll_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL)
+        current_tick = int(self.current_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL)
+        tracked_orders = list(self._order_tracker.active_orders.values())
+        if current_tick <= last_tick or len(tracked_orders) == 0:
+            return
+        tasks = [self._request_order_status(order) for order in tracked_orders]
+        results = await safe_gather(*tasks, return_exceptions=True)
+        for order_update, tracked_order in zip(results, tracked_orders):
+            client_order_id = tracked_order.client_order_id
+            if isinstance(order_update, Exception):
+                if self._is_order_not_found_during_status_update_error(order_update):
+                    await self._order_tracker.process_order_not_found(client_order_id)
                 else:
-                    await self._update_positions()
-        elif event_type == "MARGIN_CALL":
-            positions = event_message.get("p", [])
-            total_maint_margin_required = Decimal(0)
-            # total_pnl = 0
-            negative_pnls_msg = ""
-            for position in positions:
-                trading_pair = position["s"]
-                try:
-                    hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(trading_pair)
-                except KeyError:
-                    # Ignore results for which their symbols is not tracked by the connector
-                    continue
-                existing_position = self._perpetual_trading.get_position(hb_trading_pair, PositionSide[position['ps']])
-                if existing_position is not None:
-                    existing_position.update_position(position_side=PositionSide[position["ps"]],
-                                                      unrealized_pnl=Decimal(position["up"]),
-                                                      amount=Decimal(position["pa"]))
-                total_maint_margin_required += Decimal(position.get("mm", "0"))
-                if float(position.get("up", 0)) < 1:
-                    negative_pnls_msg += f"{hb_trading_pair}: {position.get('up')}, "
-            self.logger().warning("Margin Call: Your position risk is too high, and you are at risk of "
-                                  "liquidation. Close your positions or add additional margin to your wallet.")
-            self.logger().info(f"Margin Required: {total_maint_margin_required}. "
-                               f"Negative PnL assets: {negative_pnls_msg}.")
+                    self.logger().network(
+                        f"Error fetching status update for the order {client_order_id}: {order_update}.")
+                continue
+            self._order_tracker.process_order_update(order_update)
 
-    async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
-        """
-        Queries the necessary API endpoint and initialize the TradingRule object for each trading pair being traded.
-
-        Parameters
-        ----------
-        exchange_info_dict:
-            Trading rules dictionary response from the exchange
-        """
-        rules: list = exchange_info_dict.get("symbols", [])
-        return_val: list = []
-        for rule in rules:
-            try:
-                if web_utils.is_exchange_information_valid(rule):
-                    trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule["symbol"])
-                    filters = rule["filters"]
-                    filt_dict = {fil["filterType"]: fil for fil in filters}
-
-                    min_order_size = Decimal(filt_dict.get("LOT_SIZE").get("minQty"))
-                    step_size = Decimal(filt_dict.get("LOT_SIZE").get("stepSize"))
-                    tick_size = Decimal(filt_dict.get("PRICE_FILTER").get("tickSize"))
-                    min_notional = Decimal(filt_dict.get("MIN_NOTIONAL").get("notional"))
-                    collateral_token = rule["marginAsset"]
-
-                    return_val.append(
-                        TradingRule(
-                            trading_pair,
-                            min_order_size=min_order_size,
-                            min_price_increment=Decimal(tick_size),
-                            min_base_amount_increment=Decimal(step_size),
-                            min_notional_size=Decimal(min_notional),
-                            buy_order_collateral_token=collateral_token,
-                            sell_order_collateral_token=collateral_token,
-                        )
-                    )
-            except Exception as e:
-                self.logger().error(
-                    f"Error parsing the trading pair rule {rule}. Error: {e}. Skipping...", exc_info=True
-                )
-        return return_val
-
-    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
-        mapping = bidict()
-        for symbol_data in filter(web_utils.is_exchange_information_valid, exchange_info.get("symbols", [])):
-            exchange_symbol = symbol_data["pair"]
-            base = symbol_data["baseAsset"]
-            quote = symbol_data["quoteAsset"]
-            trading_pair = combine_to_hb_trading_pair(base, quote)
-            if trading_pair in mapping.inverse:
-                self._resolve_trading_pair_symbols_duplicate(mapping, exchange_symbol, base, quote)
-            else:
-                mapping[exchange_symbol] = trading_pair
-        self._set_trading_pair_symbol_map(mapping)
-
-    async def _get_last_traded_price(self, trading_pair: str) -> float:
-        exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        params = {"symbol": exchange_symbol}
-        response = await self._api_get(
-            path_url=CONSTANTS.TICKER_PRICE_CHANGE_URL,
-            params=params)
-        price = float(response["lastPrice"])
-        return price
-
-    def _resolve_trading_pair_symbols_duplicate(self, mapping: bidict, new_exchange_symbol: str, base: str, quote: str):
-        """Resolves name conflicts provoked by futures contracts.
-
-        If the expected BASEQUOTE combination matches one of the exchange symbols, it is the one taken, otherwise,
-        the trading pair is removed from the map and an error is logged.
-        """
-        expected_exchange_symbol = f"{base}{quote}"
-        trading_pair = combine_to_hb_trading_pair(base, quote)
-        current_exchange_symbol = mapping.inverse[trading_pair]
-        if current_exchange_symbol == expected_exchange_symbol:
-            pass
-        elif new_exchange_symbol == expected_exchange_symbol:
-            mapping.pop(current_exchange_symbol)
-            mapping[new_exchange_symbol] = trading_pair
-        else:
-            self.logger().error(
-                f"Could not resolve the exchange symbols {new_exchange_symbol} and {current_exchange_symbol}")
-            mapping.pop(current_exchange_symbol)
+    # --------------------------------------------------------------- balances
 
     async def _update_balances(self):
-        """
-        Calls the REST API to update total and available balances.
-        """
         local_asset_names = set(self._account_balances.keys())
         remote_asset_names = set()
 
-        account_info = await self._api_get(path_url=CONSTANTS.ACCOUNT_INFO_URL,
-                                           is_auth_required=True)
-        assets = account_info.get("assets")
-        for asset in assets:
-            asset_name = asset.get("asset")
-            available_balance = Decimal(asset.get("availableBalance"))
-            wallet_balance = Decimal(asset.get("walletBalance"))
-            self._account_available_balances[asset_name] = available_balance
-            self._account_balances[asset_name] = wallet_balance
-            remote_asset_names.add(asset_name)
+        response = await self._api_post(
+            path_url=CONSTANTS.POSITION_CURRENT_PATH_URL,
+            data={"coType": CONSTANTS.DEFAULT_CO_TYPE},
+            is_auth_required=True)
+        self._raise_on_error(response)
+        data = response["data"] or {}
 
-        asset_names_to_remove = local_asset_names.difference(remote_asset_names)
-        for asset_name in asset_names_to_remove:
+        # MSX prices everything in USDT. ``balance`` is the free/available capital and
+        # ``AcctBalance`` (note the capital A) is the total account balance.
+        quote = "USDT"
+        available = Decimal(str(data.get("balance", "0")))
+        total = Decimal(str(data.get("AcctBalance", data.get("balance", "0"))))
+        self._account_available_balances[quote] = available
+        self._account_balances[quote] = total
+        remote_asset_names.add(quote)
+
+        for asset_name in local_asset_names.difference(remote_asset_names):
             del self._account_available_balances[asset_name]
             del self._account_balances[asset_name]
 
     async def _update_positions(self):
-        positions = await self._api_get(path_url=CONSTANTS.POSITION_INFORMATION_URL,
-                                        is_auth_required=True)
-        for position in positions:
-            trading_pair = position.get("symbol")
+        response = await self._api_post(
+            path_url=CONSTANTS.POSITION_CURRENT_PATH_URL,
+            data={"coType": CONSTANTS.DEFAULT_CO_TYPE},
+            is_auth_required=True)
+        self._raise_on_error(response)
+        data = response["data"] or {}
+        pos_list = data.get("posList") or []
+
+        seen_keys = set()
+        self._position_id_by_symbol_side.clear()
+        for pos in pos_list:
+            symbol = pos.get("symbol")
             try:
-                hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(trading_pair)
+                hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol)
             except KeyError:
-                # Ignore results for which their symbols is not tracked by the connector
                 continue
-            position_side = PositionSide[position.get("positionSide")]
-            unrealized_pnl = Decimal(position.get("unRealizedProfit"))
-            entry_price = Decimal(position.get("entryPrice"))
-            amount = Decimal(position.get("positionAmt"))
-            leverage = Decimal(position.get("leverage"))
+            position_side = PositionSide.LONG if int(pos.get("longFlag")) == CONSTANTS.SIDE_LONG else PositionSide.SHORT
+            self._position_id_by_symbol_side[(symbol, position_side)] = int(pos["id"])
+
+            amount = Decimal(str(pos.get("nowVolTotal", "0")))
+            if position_side == PositionSide.SHORT:
+                amount = -amount
+            unrealized_pnl = Decimal(str(pos.get("pnl", "0")))
+            entry_price = Decimal(str(pos.get("avgPrice", "0")))
+            leverage = Decimal(str(pos.get("leverage", DEFAULT_LEVERAGE)))
             pos_key = self._perpetual_trading.position_key(hb_trading_pair, position_side)
-            if amount != 0:
+            if amount != Decimal("0"):
                 _position = Position(
-                    trading_pair=await self.trading_pair_associated_to_exchange_symbol(trading_pair),
+                    trading_pair=hb_trading_pair,
                     position_side=position_side,
                     unrealized_pnl=unrealized_pnl,
                     entry_price=entry_price,
                     amount=amount,
-                    leverage=leverage
+                    leverage=leverage,
                 )
                 self._perpetual_trading.set_position(pos_key, _position)
+                seen_keys.add(pos_key)
             else:
                 self._perpetual_trading.remove_position(pos_key)
 
-    async def _update_order_fills_from_trades(self):
-        last_tick = int(self._last_poll_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL)
-        current_tick = int(self.current_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL)
-        if current_tick > last_tick and len(self._order_tracker.active_orders) > 0:
-            trading_pairs_to_order_map: Dict[str, Dict[str, Any]] = defaultdict(lambda: {})
-            for order in self._order_tracker.active_orders.values():
-                trading_pairs_to_order_map[order.trading_pair][order.exchange_order_id] = order
-            trading_pairs = list(trading_pairs_to_order_map.keys())
-            tasks = [
-                self._api_get(
-                    path_url=CONSTANTS.ACCOUNT_TRADE_LIST_URL,
-                    params={"symbol": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)},
-                    is_auth_required=True,
+        # Drop any locally tracked positions no longer reported by the exchange.
+        for pos_key in list(self._perpetual_trading.account_positions.keys()):
+            if pos_key not in seen_keys:
+                self._perpetual_trading.remove_position(pos_key)
+
+    async def _fetch_position_id(self, symbol: str, position_side: PositionSide) -> Optional[int]:
+        """Fetch /position/current and return the matching position id (posId) for closing."""
+        response = await self._api_post(
+            path_url=CONSTANTS.POSITION_CURRENT_PATH_URL,
+            data={"symbol": symbol, "coType": CONSTANTS.DEFAULT_CO_TYPE},
+            is_auth_required=True,
+            return_err=True)
+        if response.get("code") != CONSTANTS.SUCCESS_CODE:
+            return None
+        for pos in (response.get("data") or {}).get("posList") or []:
+            side = PositionSide.LONG if int(pos.get("longFlag")) == CONSTANTS.SIDE_LONG else PositionSide.SHORT
+            if pos.get("symbol") == symbol and side == position_side:
+                pos_id = int(pos["id"])
+                self._position_id_by_symbol_side[(symbol, position_side)] = pos_id
+                return pos_id
+        return None
+
+    # ---------------------------------------------------------- trading rules
+
+    async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
+        # ``exchange_info_dict`` here maps trading_pair -> price-steps ``data`` (see _update_trading_rules).
+        rules: List[TradingRule] = []
+        for trading_pair, steps_data in exchange_info_dict.items():
+            try:
+                steps = steps_data.get("steps") or []
+                # The smallest step is the price tick size.
+                min_price_increment = (
+                    min(Decimal(str(s)) for s in steps) if steps else DEFAULT_MIN_AMOUNT_INCREMENT
                 )
-                for trading_pair in trading_pairs
-            ]
-            self.logger().debug(f"Polling for order fills of {len(tasks)} trading_pairs.")
-            results = await safe_gather(*tasks, return_exceptions=True)
-            for trades, trading_pair in zip(results, trading_pairs):
-                order_map = trading_pairs_to_order_map.get(trading_pair)
-                if isinstance(trades, Exception):
-                    self.logger().network(
-                        f"Error fetching trades update for the order {trading_pair}: {trades}.",
-                        app_warning_msg=f"Failed to fetch trade update for {trading_pair}."
+                rules.append(
+                    TradingRule(
+                        trading_pair,
+                        min_order_size=DEFAULT_MIN_ORDER_SIZE,
+                        min_price_increment=min_price_increment,
+                        min_base_amount_increment=DEFAULT_MIN_AMOUNT_INCREMENT,
+                        min_notional_size=DEFAULT_MIN_NOTIONAL,
+                        buy_order_collateral_token="USDT",
+                        sell_order_collateral_token="USDT",
                     )
-                    continue
-                for trade in trades:
-                    order_id = str(trade.get("orderId"))
-                    if order_id in order_map:
-                        tracked_order: InFlightOrder = order_map.get(order_id)
-                        position_side = trade["positionSide"]
-                        position_action = (PositionAction.OPEN
-                                           if (tracked_order.trade_type is TradeType.BUY and position_side == "LONG"
-                                               or tracked_order.trade_type is TradeType.SELL and position_side == "SHORT")
-                                           else PositionAction.CLOSE)
-                        fee = TradeFeeBase.new_perpetual_fee(
-                            fee_schema=self.trade_fee_schema(),
-                            position_action=position_action,
-                            percent_token=trade["commissionAsset"],
-                            flat_fees=[TokenAmount(amount=Decimal(trade["commission"]), token=trade["commissionAsset"])]
-                        )
-                        trade_update: TradeUpdate = TradeUpdate(
-                            trade_id=str(trade["id"]),
-                            client_order_id=tracked_order.client_order_id,
-                            exchange_order_id=trade["orderId"],
-                            trading_pair=tracked_order.trading_pair,
-                            fill_timestamp=trade["time"] * 1e-3,
-                            fill_price=Decimal(trade["price"]),
-                            fill_base_amount=Decimal(trade["qty"]),
-                            fill_quote_amount=Decimal(trade["quoteQty"]),
-                            fee=fee,
-                        )
-                        self._order_tracker.process_trade_update(trade_update)
-
-    async def _update_order_status(self):
-        """
-        Calls the REST API to get order/trade updates for each in-flight order.
-        """
-        last_tick = int(self._last_poll_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL)
-        current_tick = int(self.current_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL)
-        if current_tick > last_tick and len(self._order_tracker.active_orders) > 0:
-            tracked_orders = list(self._order_tracker.active_orders.values())
-            tasks = [
-                self._api_get(
-                    path_url=CONSTANTS.ORDER_URL,
-                    params={
-                        "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair),
-                        "origClientOrderId": order.client_order_id
-                    },
-                    is_auth_required=True,
-                    return_err=True,
                 )
-                for order in tracked_orders
-            ]
-            self.logger().debug(f"Polling for order status updates of {len(tasks)} orders.")
-            results = await safe_gather(*tasks, return_exceptions=True)
+            except Exception as e:
+                self.logger().error(
+                    f"Error parsing trading pair rule for {trading_pair}: {e}. Skipping...", exc_info=True)
+        return rules
 
-            for order_update, tracked_order in zip(results, tracked_orders):
-                client_order_id = tracked_order.client_order_id
-                if client_order_id not in self._order_tracker.all_orders:
-                    continue
-                if isinstance(order_update, Exception) or "code" in order_update:
-                    if not isinstance(order_update, Exception) and \
-                            (order_update["code"] == -2013 or order_update["msg"] == "Order does not exist."):
-                        await self._order_tracker.process_order_not_found(client_order_id)
-                    else:
-                        self.logger().network(
-                            f"Error fetching status update for the order {client_order_id}: " f"{order_update}."
-                        )
-                    continue
-
-                new_order_update: OrderUpdate = OrderUpdate(
-                    trading_pair=await self.trading_pair_associated_to_exchange_symbol(order_update['symbol']),
-                    update_timestamp=order_update["updateTime"] * 1e-3,
-                    new_state=CONSTANTS.ORDER_STATE[order_update["status"]],
-                    client_order_id=order_update["clientOrderId"],
-                    exchange_order_id=order_update["orderId"],
+    async def _update_trading_rules(self):
+        # No exchangeInfo: build a {trading_pair: price-steps data} dict by querying /price-steps per pair.
+        steps_by_pair: Dict[str, Any] = {}
+        for trading_pair in self._trading_pairs or []:
+            symbol = utils.convert_to_exchange_trading_pair(trading_pair)
+            try:
+                resp = await self._api_get(
+                    path_url=CONSTANTS.PRICE_STEPS_PATH_URL + "/" + symbol,
+                    limit_id=CONSTANTS.PRICE_STEPS_PATH_URL,
                 )
+                if resp.get("code") == CONSTANTS.SUCCESS_CODE:
+                    steps_by_pair[trading_pair] = resp.get("data") or {}
+            except Exception as e:
+                self.logger().error(f"Error fetching price steps for {trading_pair}: {e}", exc_info=True)
+        trading_rules_list = await self._format_trading_rules(steps_by_pair)
+        self._trading_rules.clear()
+        for trading_rule in trading_rules_list:
+            self._trading_rules[trading_rule.trading_pair] = trading_rule
+        self._initialize_trading_pair_symbols_from_exchange_info(steps_by_pair)
 
-                self._order_tracker.process_order_update(new_order_update)
+    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
+        # No exchangeInfo listing; derive the symbol map directly from the configured trading pairs.
+        mapping = bidict()
+        for trading_pair in self._trading_pairs or []:
+            exchange_symbol = utils.convert_to_exchange_trading_pair(trading_pair)
+            mapping[exchange_symbol] = trading_pair
+        self._set_trading_pair_symbol_map(mapping)
 
-    async def _get_position_mode(self) -> Optional[PositionMode]:
-        # To-do: ensure there's no active order or contract before changing position mode
-        if self._position_mode is None:
-            response = await self._api_get(
-                path_url=CONSTANTS.CHANGE_POSITION_MODE_URL,
-                is_auth_required=True,
-                limit_id=CONSTANTS.GET_POSITION_MODE_LIMIT_ID,
-                return_err=True
-            )
-            self._position_mode = PositionMode.HEDGE if response.get("dualSidePosition") else PositionMode.ONEWAY
+    async def _initialize_trading_pair_symbol_map(self):
+        # Override: MSX has no exchangeInfo to query, so build the map from configured pairs.
+        try:
+            self._initialize_trading_pair_symbols_from_exchange_info({})
+        except Exception:
+            self.logger().exception("There was an error initializing the trading pair symbols map.")
 
-        return self._position_mode
+    async def _get_last_traded_price(self, trading_pair: str) -> float:
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        response = await self._api_get(
+            path_url=CONSTANTS.TICKER_PATH_URL + "/" + symbol,
+            limit_id=CONSTANTS.TICKER_PATH_URL,
+        )
+        self._raise_on_error(response)
+        data = response["data"]
+        price = data.get("close", data.get("lastPrice"))
+        return float(price)
 
-    async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
-        msg = ""
-        success = True
-        initial_mode = await self._get_position_mode()
-        if initial_mode != mode:
-            params = {
-                "dualSidePosition": True if mode == PositionMode.HEDGE else False,
-            }
-            response = await self._api_post(
-                path_url=CONSTANTS.CHANGE_POSITION_MODE_URL,
-                data=params,
-                is_auth_required=True,
-                limit_id=CONSTANTS.POST_POSITION_MODE_LIMIT_ID,
-                return_err=True
-            )
-            if not (response["msg"] == "success" and response["code"] == 200):
-                success = False
-                return success, str(response)
-            self._position_mode = mode
-        return success, msg
+    # ------------------------------------------------------ leverage / margin
 
     async def _set_trading_pair_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
-        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        params = {'symbol': symbol, 'leverage': leverage}
-        set_leverage = await self._api_post(
-            path_url=CONSTANTS.SET_LEVERAGE_URL,
-            data=params,
-            is_auth_required=True,
-        )
-        success = False
-        msg = ""
-        if set_leverage["leverage"] == leverage:
-            success = True
-        else:
-            msg = 'Unable to set leverage'
-        return success, msg
+        # MSX has no set-leverage endpoint; leverage is supplied per order on open. Store it locally.
+        return True, ""
+
+    async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
+        if mode != PositionMode.ONEWAY:
+            return False, "MSX only supports ONEWAY position mode."
+        self._position_mode = PositionMode.ONEWAY
+        return True, ""
+
+    async def _get_position_mode(self) -> Optional[PositionMode]:
+        self._position_mode = PositionMode.ONEWAY
+        return self._position_mode
 
     async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal, Decimal]:
-        exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        payment_response = await self._api_get(
-            path_url=CONSTANTS.GET_INCOME_HISTORY_URL,
-            params={
-                "symbol": exchange_symbol,
-                "incomeType": "FUNDING_FEE",
-            },
-            is_auth_required=True,
-        )
-        funding_info_response = await self._api_get(
-            path_url=CONSTANTS.MARK_PRICE_URL,
-            params={
-                "symbol": exchange_symbol,
-            },
-        )
-        sorted_payment_response = sorted(payment_response, key=lambda a: a.get('time', 0), reverse=True)
-        if len(sorted_payment_response) < 1:
-            timestamp, funding_rate, payment = 0, Decimal("-1"), Decimal("-1")
-            return timestamp, funding_rate, payment
-        funding_payment = sorted_payment_response[0]
-        _payment = Decimal(funding_payment["income"])
-        funding_rate = Decimal(funding_info_response["lastFundingRate"])
-        timestamp = funding_payment["time"]
-        if _payment != Decimal("0"):
-            payment = _payment
-        else:
-            timestamp, funding_rate, payment = 0, Decimal("-1"), Decimal("-1")
-        return timestamp, funding_rate, payment
+        # MSX documents no funding-fee/income endpoint.
+        return 0, Decimal("-1"), Decimal("-1")
+
+    # ----------------------------------------------------------------- helpers
+
+    def _leverage_for(self, trading_pair: str) -> int:
+        try:
+            leverage = self._perpetual_trading.get_leverage(trading_pair)
+        except KeyError:
+            leverage = DEFAULT_LEVERAGE
+        return int(leverage) if leverage else DEFAULT_LEVERAGE
+
+    @staticmethod
+    def _find_order(response: Dict[str, Any], target_id: int) -> Optional[Dict[str, Any]]:
+        if isinstance(response, Exception) or not isinstance(response, dict):
+            return None
+        if response.get("code") != CONSTANTS.SUCCESS_CODE:
+            return None
+        for item in response.get("data") or []:
+            try:
+                if int(item.get("id")) == target_id:
+                    return item
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _raise_on_error(response: Dict[str, Any]):
+        if not isinstance(response, dict) or response.get("code") != CONSTANTS.SUCCESS_CODE:
+            message = response.get("message") if isinstance(response, dict) else str(response)
+            raise IOError(f"MSX API error: {message} (full response: {response})")
