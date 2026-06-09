@@ -1,135 +1,164 @@
 from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
 
+# 来源: docs/connectors/msx-api-notes.md (从 msx_api_docs/ 摘录)
+
 EXCHANGE_NAME = "msx_perpetual"
-BROKER_ID = "x-nbQe1H39"
+# MSX 无 broker/client order id 概念; 订单标识为服务端 orderId。
 MAX_ORDER_ID_LEN = 32
 
 DOMAIN = EXCHANGE_NAME
 TESTNET_DOMAIN = "msx_perpetual_testnet"
 
-PERPETUAL_BASE_URL = "https://fapi.binance.com/fapi/"
-TESTNET_BASE_URL = "https://testnet.binancefuture.com/fapi/"
+# REST: 合约 base path /api/v1/futures/open-api。host 以申请账户时下发为准。
+REST_HOST = "https://api9528mystks.mystonks.org"
+TESTNET_REST_HOST = "https://test.test9527.xyz"
+PERPETUAL_BASE_PATH = "/api/v1/futures/open-api"
 
-PERPETUAL_WS_URL = "wss://fstream.binance.com/"
-TESTNET_WS_URL = "wss://stream.binancefuture.com/"
+PERPETUAL_BASE_URL = f"{REST_HOST}{PERPETUAL_BASE_PATH}"
+TESTNET_BASE_URL = f"{TESTNET_REST_HOST}{PERPETUAL_BASE_PATH}"
 
-PUBLIC_WS_ENDPOINT = "public/stream"   # For @depth (combined stream, wrapped {stream,data} messages)
-MARKET_WS_ENDPOINT = "market/stream"   # For @aggTrade, @markPrice (combined stream)
-PRIVATE_WS_ENDPOINT = "private/ws"     # For user stream; listenKey is passed as ?listenKey= query param
+# WebSocket: 单一端点, 公共行情与私有共用(私有需签名订阅)。
+PERPETUAL_WS_URL = "wss://api9528mystks.mystonks.org/api/v1/futures/ws"
+TESTNET_WS_URL = "wss://api9528mystks.mystonks.org/api/v1/futures/ws"
 
-TIME_IN_FORCE_GTC = "GTC"  # Good till cancelled
-TIME_IN_FORCE_GTX = "GTX"  # Good Till Crossing
-TIME_IN_FORCE_IOC = "IOC"  # Immediate or cancel
-TIME_IN_FORCE_FOK = "FOK"  # Fill or kill
+# 鉴权 header (公共/认证.md)
+HEADER_ACCESS_KEY = "ACCESS-KEY"
+HEADER_ACCESS_SIGN = "ACCESS-SIGN"
+HEADER_ACCESS_TIMESTAMP = "ACCESS-TIMESTAMP"
 
-# Public API v1 Endpoints
-SNAPSHOT_REST_URL = "v1/depth"
-TICKER_PRICE_URL = "v1/ticker/bookTicker"
-TICKER_PRICE_CHANGE_URL = "v1/ticker/24hr"
-EXCHANGE_INFO_URL = "v1/exchangeInfo"
-RECENT_TRADES_URL = "v1/trades"
-PING_URL = "v1/ping"
-MARK_PRICE_URL = "v1/premiumIndex"
-SERVER_TIME_PATH_URL = "v1/time"
+# 合约类型 coType
+CO_TYPE_US_STOCK = 1
+CO_TYPE_HK_STOCK = 2
+CO_TYPE_CRYPTO = 3
+DEFAULT_CO_TYPE = CO_TYPE_CRYPTO
 
-# Private API v1 Endpoints
-ORDER_URL = "v1/order"
-CANCEL_ALL_OPEN_ORDERS_URL = "v1/allOpenOrders"
-ACCOUNT_TRADE_LIST_URL = "v1/userTrades"
-SET_LEVERAGE_URL = "v1/leverage"
-GET_INCOME_HISTORY_URL = "v1/income"
-CHANGE_POSITION_MODE_URL = "v1/positionSide/dual"
+# 订单类型 orderType
+ORDER_TYPE_LIMIT = 1
+ORDER_TYPE_MARKET = 2
 
-POST_POSITION_MODE_LIMIT_ID = f"POST{CHANGE_POSITION_MODE_URL}"
-GET_POSITION_MODE_LIMIT_ID = f"GET{CHANGE_POSITION_MODE_URL}"
+# 开平仓 openType / openFlag
+OPEN_TYPE_OPEN = 1
+OPEN_TYPE_CLOSE = 2
 
-# Private API v2 Endpoints
-ACCOUNT_INFO_URL = "v2/account"
-POSITION_INFORMATION_URL = "v2/positionRisk"
+# 方向 side / longFlag
+SIDE_LONG = 1   # 多(买)
+SIDE_SHORT = 2  # 空(卖)
 
-# Private API Endpoints
-BINANCE_USER_STREAM_ENDPOINT = "v1/listenKey"
+# 保证金模式 marginMode
+MARGIN_MODE_CROSS = 1
+MARGIN_MODE_ISOLATED = 2
+
+# 触发类型 triggerType
+TRIGGER_NORMAL = 1
+TRIGGER_TAKE_PROFIT = 2
+TRIGGER_STOP_LOSS = 3
+TRIGGER_LIQUIDATION = 4
+
+# REST Endpoints (path 相对 PERPETUAL_BASE_PATH; web_utils 拼成完整 url)
+# 市场数据(公开, GET)
+SNAPSHOT_PATH_URL = "/orderbook"          # GET /orderbook/{symbol}
+KLINE_PATH_URL = "/kline"                 # GET /kline
+TICKER_PATH_URL = "/ticker"               # GET /ticker/{symbol}
+PRICE_STEPS_PATH_URL = "/price-steps"     # GET /price-steps/{symbol}
+
+# 订单/持仓(私有, POST, 需签名)
+ORDER_CREATE_PATH_URL = "/order/create"
+ORDER_CANCEL_PATH_URL = "/order/cancel"
+ORDER_LIMIT_PATH_URL = "/order/limit"             # 当前未成交委托
+ORDER_HISTORY_PATH_URL = "/order/history"
+ORDER_ENTRUST_HISTORY_PATH_URL = "/order/entrust-history"
+POSITION_CURRENT_PATH_URL = "/position/current"
+POSITION_HISTORY_PATH_URL = "/position/history"
+
+# 限流标识(用于 throttler)
+LIMIT_ID_PUBLIC = "PUBLIC"
+LIMIT_ID_PRIVATE = "PRIVATE"
 
 # Funding Settlement Time Span
-FUNDING_SETTLEMENT_DURATION = (0, 30)  # seconds before snapshot, seconds after snapshot
+FUNDING_SETTLEMENT_DURATION = (0, 30)  # seconds before/after snapshot
 
-# Order Statuses
+# 订单状态 status -> Hummingbot OrderState (msx-api-notes 第5节)
+# 0=init 1=new 2=filled 3=part_filled 4=canceled 5=pending_cancel 6=expired
 ORDER_STATE = {
-    "NEW": OrderState.OPEN,
-    "FILLED": OrderState.FILLED,
-    "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
-    "CANCELED": OrderState.CANCELED,
-    "EXPIRED": OrderState.CANCELED,
-    "REJECTED": OrderState.FAILED,
-    "EXPIRED_IN_MATCH": OrderState.FAILED,
+    0: OrderState.OPEN,
+    1: OrderState.OPEN,
+    2: OrderState.FILLED,
+    3: OrderState.PARTIALLY_FILLED,
+    4: OrderState.CANCELED,
+    5: OrderState.PENDING_CANCEL,
+    6: OrderState.FAILED,
 }
 
-# Rate Limit Type
-REQUEST_WEIGHT = "REQUEST_WEIGHT"
-ORDERS_1MIN = "ORDERS_1MIN"
-ORDERS_1SEC = "ORDERS_1SEC"
-
+# WS stream id (内部区分订阅)
 DIFF_STREAM_ID = 1
 TRADE_STREAM_ID = 2
 FUNDING_INFO_STREAM_ID = 3
-HEARTBEAT_TIME_INTERVAL = 30.0
+
+# WS 心跳: 70s 无消息断开, 建议 20s 发 ping
+HEARTBEAT_TIME_INTERVAL = 20.0
+WS_HEARTBEAT_TIMEOUT = 70.0
+
+# WS 信封/动作
+WS_ACTION_SUBSCRIBE = "subscribe"
+WS_ACTION_UNSUBSCRIBE = "unsubscribe"
+WS_ACTION_PING = "ping"
+WS_EVENT_PONG = "pong"
+
+# WS channel/action 名 (msx-api-notes 第3节)
+WS_ORDER_BOOK_UPDATE = "order_book_update"   # Shape A: action/result
+WS_BOOK_TICKER = "book_ticker"               # Shape A
+WS_CHANNEL_ORDER_BOOK = "order_book"         # Shape B: event/channel/data
+WS_CHANNEL_TICKER = "ticker"                 # Shape B
+WS_CHANNEL_KLINE = "kline"                   # Shape B
 
 # Rate Limit time intervals
-ONE_HOUR = 3600
 ONE_MINUTE = 60
 ONE_SECOND = 1
-ONE_DAY = 86400
 
-MAX_REQUEST = 2400
+# 做市商档限流: RPS=100, RPM=3000 (公共/限流规则.md)
+MAX_RPS = 100
+MAX_RPM = 3000
 
 RATE_LIMITS = [
-    # Pool Limits
-    RateLimit(limit_id=REQUEST_WEIGHT, limit=2400, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=ORDERS_1MIN, limit=1200, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=ORDERS_1SEC, limit=300, time_interval=10),
-    # Weight Limits for individual endpoints
-    RateLimit(limit_id=SNAPSHOT_REST_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=20)]),
-    RateLimit(limit_id=TICKER_PRICE_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=2)]),
-    RateLimit(limit_id=TICKER_PRICE_CHANGE_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
-    RateLimit(limit_id=EXCHANGE_INFO_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=40)]),
-    RateLimit(limit_id=RECENT_TRADES_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
-    RateLimit(limit_id=BINANCE_USER_STREAM_ENDPOINT, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
-    RateLimit(limit_id=PING_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
-    RateLimit(limit_id=SERVER_TIME_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
-    RateLimit(limit_id=ORDER_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1),
-                             LinkedLimitWeightPair(ORDERS_1MIN, weight=1),
-                             LinkedLimitWeightPair(ORDERS_1SEC, weight=1)]),
-    RateLimit(limit_id=CANCEL_ALL_OPEN_ORDERS_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
-    RateLimit(limit_id=ACCOUNT_TRADE_LIST_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=5)]),
-    RateLimit(limit_id=SET_LEVERAGE_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
-    RateLimit(limit_id=GET_INCOME_HISTORY_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=30)]),
-    RateLimit(limit_id=POST_POSITION_MODE_LIMIT_ID, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
-    RateLimit(limit_id=GET_POSITION_MODE_LIMIT_ID, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=30)]),
-    RateLimit(limit_id=ACCOUNT_INFO_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=5)]),
-    RateLimit(limit_id=POSITION_INFORMATION_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE, weight=5,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=5)]),
-    RateLimit(limit_id=MARK_PRICE_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE, weight=1,
-              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
+    # 全局池(按做市商档)
+    RateLimit(limit_id=LIMIT_ID_PUBLIC, limit=MAX_RPM, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=LIMIT_ID_PRIVATE, limit=MAX_RPM, time_interval=ONE_MINUTE),
+    # 每秒上限
+    RateLimit(limit_id="PUBLIC_RPS", limit=MAX_RPS, time_interval=ONE_SECOND),
+    RateLimit(limit_id="PRIVATE_RPS", limit=MAX_RPS, time_interval=ONE_SECOND),
+    # 各 endpoint 权重 1, 链接到对应池 + 每秒池
+    RateLimit(limit_id=SNAPSHOT_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PUBLIC), LinkedLimitWeightPair("PUBLIC_RPS")]),
+    RateLimit(limit_id=KLINE_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PUBLIC), LinkedLimitWeightPair("PUBLIC_RPS")]),
+    RateLimit(limit_id=TICKER_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PUBLIC), LinkedLimitWeightPair("PUBLIC_RPS")]),
+    RateLimit(limit_id=PRICE_STEPS_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PUBLIC), LinkedLimitWeightPair("PUBLIC_RPS")]),
+    RateLimit(limit_id=ORDER_CREATE_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
+    RateLimit(limit_id=ORDER_CANCEL_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
+    RateLimit(limit_id=ORDER_LIMIT_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
+    RateLimit(limit_id=ORDER_HISTORY_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
+    RateLimit(limit_id=ORDER_ENTRUST_HISTORY_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
+    RateLimit(limit_id=POSITION_CURRENT_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
+    RateLimit(limit_id=POSITION_HISTORY_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
 ]
 
-ORDER_NOT_EXIST_ERROR_CODE = -2013
-ORDER_NOT_EXIST_MESSAGE = "Order does not exist"
-UNKNOWN_ORDER_ERROR_CODE = -2011
-UNKNOWN_ORDER_MESSAGE = "Unknown order sent"
+# 成功码 (合约 code==200; 错误用 message 字段)
+SUCCESS_CODE = 200
+
+# 常见错误码 (公共/通用响应格式.md)
+ERR_PARAM = 400
+ERR_AUTH = 401
+ERR_FORBIDDEN = 403
+ERR_NOT_FOUND = 404
+ERR_RATE_LIMIT = 429
+ERR_SERVER = 500
