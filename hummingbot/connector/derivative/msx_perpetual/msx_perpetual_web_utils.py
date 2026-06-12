@@ -20,6 +20,8 @@ class MsxPerpetualRESTPreProcessor(RESTPreProcessorBase):
         request.headers["Content-Type"] = (
             "application/json" if request.method == RESTMethod.POST else "application/x-www-form-urlencoded"
         )
+        # Cloudflare 拦默认 Python UA, 所有请求必须带浏览器 UA。
+        request.headers.setdefault("User-Agent", CONSTANTS.DEFAULT_USER_AGENT)
         return request
 
 

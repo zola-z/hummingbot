@@ -12,7 +12,7 @@ TESTNET_DOMAIN = "msx_perpetual_testnet"
 
 # REST: 合约 base path /api/v1/futures/open-api。host 以申请账户时下发为准。
 REST_HOST = "https://api9528mystks.mystonks.org"
-TESTNET_REST_HOST = "https://test.test9527.xyz"
+TESTNET_REST_HOST = "https://test.test9529.xyz"
 PERPETUAL_BASE_PATH = "/api/v1/futures/open-api"
 
 PERPETUAL_BASE_URL = f"{REST_HOST}{PERPETUAL_BASE_PATH}"
@@ -20,7 +20,7 @@ TESTNET_BASE_URL = f"{TESTNET_REST_HOST}{PERPETUAL_BASE_PATH}"
 
 # WebSocket: 单一端点, 公共行情与私有共用(私有需签名订阅)。
 PERPETUAL_WS_URL = "wss://api9528mystks.mystonks.org/api/v1/futures/ws"
-TESTNET_WS_URL = "wss://api9528mystks.mystonks.org/api/v1/futures/ws"
+TESTNET_WS_URL = "wss://test.test9529.xyz/api/v1/futures/ws"
 
 # 鉴权 header (公共/认证.md)
 HEADER_ACCESS_KEY = "ACCESS-KEY"
@@ -48,6 +48,8 @@ SIDE_SHORT = 2  # 空(卖)
 # 保证金模式 marginMode
 MARGIN_MODE_CROSS = 1
 MARGIN_MODE_ISOLATED = 2
+# 默认逐仓: 实测测试账户全仓(1)下单返回 8012/8020, 逐仓(2)可成功下单。
+DEFAULT_MARGIN_MODE = MARGIN_MODE_ISOLATED
 
 # 触发类型 triggerType
 TRIGGER_NORMAL = 1
@@ -152,8 +154,16 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
 ]
 
-# 成功码 (合约 code==200; 错误用 message 字段)
+# 成功码: 私有(订单/持仓)接口返回 code==200; 公共行情接口返回 code==0。
+# 两者都表示成功(实测测试环境), 用集合统一判定。
 SUCCESS_CODE = 200
+SUCCESS_CODES = (0, 200)
+
+# Cloudflare 会拦默认 Python UA, 所有请求需带浏览器 User-Agent。
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 # 常见错误码 (公共/通用响应格式.md)
 ERR_PARAM = 400

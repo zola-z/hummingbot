@@ -155,6 +155,52 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn("price", request_body)
 
     @aioresponses()
+    async def test_place_order_uses_isolated_margin_mode_by_default(self, mock_api):
+        # 实测测试账户全仓下单被拒, 默认用逐仓(2)。
+        self._simulate_trading_rules_initialized()
+        self.exchange._perpetual_trading.set_leverage(self.trading_pair, 10)
+        url = web_utils.private_rest_url(CONSTANTS.ORDER_CREATE_PATH_URL, domain=self.domain)
+        mock_api.post(
+            self._regex(url),
+            body=json.dumps({"code": 200, "msg": "success", "data": {"orderId": 7, "orderNo": "N3"}}),
+        )
+        await self.exchange._place_order(
+            order_id="OID3", trading_pair=self.trading_pair, amount=Decimal("0.5"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("30000"),
+            position_action=PositionAction.OPEN,
+        )
+        request_body = json.loads(self._last_request_body(mock_api, url))
+        self.assertEqual(CONSTANTS.MARGIN_MODE_ISOLATED, request_body["marginMode"])
+
+    @aioresponses()
+    async def test_place_order_resolves_order_id_when_response_has_no_data(self, mock_api):
+        # MSX 测试环境下单成功只回 {code, message}, 无 data.orderId; 需回查 /order/limit。
+        self._simulate_trading_rules_initialized()
+        self.exchange._perpetual_trading.set_leverage(self.trading_pair, 10)
+        create_url = web_utils.private_rest_url(CONSTANTS.ORDER_CREATE_PATH_URL, domain=self.domain)
+        mock_api.post(
+            self._regex(create_url),
+            body=json.dumps({"code": 200, "message": "订单创建成功"}),
+        )
+        limit_url = web_utils.private_rest_url(CONSTANTS.ORDER_LIMIT_PATH_URL, domain=self.domain)
+        mock_api.post(
+            self._regex(limit_url),
+            body=json.dumps({"code": 200, "data": [
+                {"id": 555, "symbol": self.symbol, "longFlag": CONSTANTS.SIDE_LONG,
+                 "openFlag": CONSTANTS.OPEN_TYPE_OPEN, "ctime": 1000, "status": 1},
+                {"id": 999, "symbol": self.symbol, "longFlag": CONSTANTS.SIDE_LONG,
+                 "openFlag": CONSTANTS.OPEN_TYPE_OPEN, "ctime": 2000, "status": 1},
+            ]}),
+        )
+        o_id, _ = await self.exchange._place_order(
+            order_id="OID4", trading_pair=self.trading_pair, amount=Decimal("0.5"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("30000"),
+            position_action=PositionAction.OPEN,
+        )
+        # 取 ctime 最新的一笔(999)。
+        self.assertEqual("999", o_id)
+
+    @aioresponses()
     async def test_place_order_close_uses_posid(self, mock_api):
         self._simulate_trading_rules_initialized()
         # Seed a cached current position (LONG) for the symbol.

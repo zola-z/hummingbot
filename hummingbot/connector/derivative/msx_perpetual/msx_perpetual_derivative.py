@@ -223,8 +223,9 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
             resp = await self._api_get(
                 path_url=CONSTANTS.TICKER_PATH_URL + "/" + symbol,
                 limit_id=CONSTANTS.TICKER_PATH_URL,
+                is_auth_required=True,  # MSX 测试环境公共接口也需签名
             )
-            if resp.get("code") == CONSTANTS.SUCCESS_CODE:
+            if self._is_success(resp):
                 return NetworkStatus.CONNECTED
             return NetworkStatus.NOT_CONNECTED
         except asyncio.CancelledError:
@@ -269,7 +270,7 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
             "openType": open_type,
             "side": side,
             "vol": f"{amount:f}",
-            "marginMode": CONSTANTS.MARGIN_MODE_CROSS,
+            "marginMode": CONSTANTS.DEFAULT_MARGIN_MODE,
             "triggerType": CONSTANTS.TRIGGER_NORMAL,
         }
         if order_type.is_limit_type():
@@ -296,11 +297,52 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
             data=api_params,
             is_auth_required=True)
         self._raise_on_error(order_result)
-        data = order_result["data"]
-        o_id = str(data["orderId"])
-        # The create response carries no update timestamp, so use local time.
         transact_time = time.time()
+
+        # MSX 测试环境的下单成功响应只返回 {code, message}, 不含 data.orderId
+        # (文档说返回 data.orderId, 实测无)。若有则直接用, 否则回查最新订单匹配。
+        data = order_result.get("data") if isinstance(order_result, dict) else None
+        if isinstance(data, dict) and data.get("orderId") is not None:
+            return str(data["orderId"]), transact_time
+        o_id = await self._resolve_new_order_id(symbol, side, open_type)
         return o_id, transact_time
+
+    async def _resolve_new_order_id(self, symbol: str, side: int, open_type: int) -> str:
+        """下单成功但响应无 orderId 时, 回查最新一笔匹配订单的 id。
+
+        优先查当前委托(/order/limit, 未成交挂单), 再查历史(/order/history, 含已成交),
+        取 ctime 最新且方向(longFlag)匹配的一笔。
+        """
+        def _pick(resp: Dict[str, Any]) -> Optional[str]:
+            if not self._is_success(resp):
+                return None
+            items = [
+                it for it in (resp.get("data") or [])
+                if int(it.get("longFlag", 0)) == side
+                and int(it.get("openFlag", 0)) == open_type
+            ]
+            if not items:
+                return None
+            newest = max(items, key=lambda it: int(it.get("ctime", 0)))
+            return str(newest.get("id"))
+
+        open_orders = await self._api_post(
+            path_url=CONSTANTS.ORDER_LIMIT_PATH_URL,
+            data={"symbol": symbol, "coType": CONSTANTS.DEFAULT_CO_TYPE},
+            is_auth_required=True, return_err=True)
+        oid = _pick(open_orders)
+        if oid is not None:
+            return oid
+        history = await self._api_post(
+            path_url=CONSTANTS.ORDER_HISTORY_PATH_URL,
+            data={"symbol": symbol, "coType": CONSTANTS.DEFAULT_CO_TYPE},
+            is_auth_required=True, return_err=True)
+        oid = _pick(history)
+        if oid is None:
+            raise IOError(
+                f"Order placed on MSX but could not resolve its orderId from /order/limit or "
+                f"/order/history (symbol={symbol}, side={side}, openType={open_type}).")
+        return oid
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         exchange_order_id = await tracked_order.get_exchange_order_id()
@@ -310,7 +352,7 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
             data=api_params,
             is_auth_required=True,
             return_err=True)
-        return cancel_result.get("code") == CONSTANTS.SUCCESS_CODE
+        return self._is_success(cancel_result)
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         # MSX exposes fills only through aggregate avgPrice/filledVol on /order/history and
@@ -450,7 +492,7 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
             data={"symbol": symbol, "coType": CONSTANTS.DEFAULT_CO_TYPE},
             is_auth_required=True,
             return_err=True)
-        if response.get("code") != CONSTANTS.SUCCESS_CODE:
+        if not self._is_success(response):
             return None
         for pos in (response.get("data") or {}).get("posList") or []:
             side = PositionSide.LONG if int(pos.get("longFlag")) == CONSTANTS.SIDE_LONG else PositionSide.SHORT
@@ -497,8 +539,9 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
                 resp = await self._api_get(
                     path_url=CONSTANTS.PRICE_STEPS_PATH_URL + "/" + symbol,
                     limit_id=CONSTANTS.PRICE_STEPS_PATH_URL,
+                    is_auth_required=True,  # MSX 测试环境公共接口也需签名
                 )
-                if resp.get("code") == CONSTANTS.SUCCESS_CODE:
+                if self._is_success(resp):
                     steps_by_pair[trading_pair] = resp.get("data") or {}
             except Exception as e:
                 self.logger().error(f"Error fetching price steps for {trading_pair}: {e}", exc_info=True)
@@ -528,6 +571,7 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         response = await self._api_get(
             path_url=CONSTANTS.TICKER_PATH_URL + "/" + symbol,
             limit_id=CONSTANTS.TICKER_PATH_URL,
+            is_auth_required=True,  # MSX 测试环境公共接口也需签名
         )
         self._raise_on_error(response)
         data = response["data"]
@@ -564,10 +608,13 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         return int(leverage) if leverage else DEFAULT_LEVERAGE
 
     @staticmethod
+    def _is_success(response: Any) -> bool:
+        # 公共行情 code==0, 私有 code==200; 均为成功。
+        return isinstance(response, dict) and response.get("code") in CONSTANTS.SUCCESS_CODES
+
+    @staticmethod
     def _find_order(response: Dict[str, Any], target_id: int) -> Optional[Dict[str, Any]]:
-        if isinstance(response, Exception) or not isinstance(response, dict):
-            return None
-        if response.get("code") != CONSTANTS.SUCCESS_CODE:
+        if not MsxPerpetualDerivative._is_success(response):
             return None
         for item in response.get("data") or []:
             try:
@@ -579,6 +626,6 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
 
     @staticmethod
     def _raise_on_error(response: Dict[str, Any]):
-        if not isinstance(response, dict) or response.get("code") != CONSTANTS.SUCCESS_CODE:
+        if not MsxPerpetualDerivative._is_success(response):
             message = response.get("message") if isinstance(response, dict) else str(response)
             raise IOError(f"MSX API error: {message} (full response: {response})")

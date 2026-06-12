@@ -81,23 +81,26 @@ class MsxPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         )
 
     async def _request_ticker(self, trading_pair: str) -> Dict[str, Any]:
-        """Fetch the 24h ticker (used as the mark/index price source for funding info)."""
+        """Fetch the 24h ticker ``data`` payload (mark/index price source for funding info)."""
         symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        data = await self._connector._api_get(
+        resp = await self._connector._api_get(
             path_url=CONSTANTS.TICKER_PATH_URL + "/" + symbol,
             limit_id=CONSTANTS.TICKER_PATH_URL,
+            is_auth_required=True,  # MSX 测试环境公共接口也需签名
         )
-        return data
+        # MSX 响应包了一层 {code, data}; 取 data。
+        return resp.get("data", resp) if isinstance(resp, dict) else resp
 
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        """Fetch the REST order book snapshot ``data`` payload (already unwrapped by the connector)."""
+        """Fetch the REST order book snapshot ``data`` payload (unwrapped from {code,data})."""
         symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        data = await self._connector._api_get(
+        resp = await self._connector._api_get(
             path_url=CONSTANTS.SNAPSHOT_PATH_URL + "/" + symbol,
             params={"depth": "100", "with_id": "true"},
             limit_id=CONSTANTS.SNAPSHOT_PATH_URL,
+            is_auth_required=True,  # MSX 测试环境公共接口也需签名
         )
-        return data
+        return resp.get("data", resp) if isinstance(resp, dict) else resp
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         """Build a SNAPSHOT OrderBookMessage from the REST snapshot, using ``data.id`` as update_id."""
