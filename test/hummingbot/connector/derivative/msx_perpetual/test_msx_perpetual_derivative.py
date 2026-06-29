@@ -155,14 +155,15 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn("price", request_body)
 
     @aioresponses()
-    async def test_place_order_uses_isolated_margin_mode_by_default(self, mock_api):
-        # 实测测试账户全仓下单被拒, 默认用逐仓(2)。
+    async def test_place_order_omits_margin_mode_v11(self, mock_api):
+        # v1.1: /order/create 不再接受 marginMode。下单 body 不应包含该字段
+        # (保证金模式由 _set_trading_pair_leverage -> /account/leverage 预设)。
         self._simulate_trading_rules_initialized()
         self.exchange._perpetual_trading.set_leverage(self.trading_pair, 10)
         url = web_utils.private_rest_url(CONSTANTS.ORDER_CREATE_PATH_URL, domain=self.domain)
         mock_api.post(
             self._regex(url),
-            body=json.dumps({"code": 200, "msg": "success", "data": {"orderId": 7, "orderNo": "N3"}}),
+            body=json.dumps({"code": 0, "msg": "success", "data": {"orderId": 7, "orderNo": "N3"}}),
         )
         await self.exchange._place_order(
             order_id="OID3", trading_pair=self.trading_pair, amount=Decimal("0.5"),
@@ -170,7 +171,7 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             position_action=PositionAction.OPEN,
         )
         request_body = json.loads(self._last_request_body(mock_api, url))
-        self.assertEqual(CONSTANTS.MARGIN_MODE_ISOLATED, request_body["marginMode"])
+        self.assertNotIn("marginMode", request_body)
 
     @aioresponses()
     async def test_place_order_resolves_order_id_when_response_has_no_data(self, mock_api):
@@ -486,10 +487,62 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
 
     # ---- leverage / position mode / funding -----------------------------------
 
-    async def test_set_trading_pair_leverage_is_local_only(self):
+    @aioresponses()
+    async def test_set_trading_pair_leverage_sets_margin_mode_then_leverage(self, mock_api):
+        # v1.1: 先 POST /account/margin-mode 设逐仓(改保证金模式唯一入口),
+        # 再 POST /account/leverage 设杠杆(其 marginMode 字段必填但不生效)。
+        margin_url = web_utils.private_rest_url(CONSTANTS.ACCOUNT_MARGIN_MODE_PATH_URL, domain=self.domain)
+        leverage_url = web_utils.private_rest_url(CONSTANTS.ACCOUNT_LEVERAGE_PATH_URL, domain=self.domain)
+        mock_api.post(
+            self._regex(margin_url),
+            body=json.dumps({"code": 0, "msg": "success",
+                             "data": {"symbol": self.symbol, "marginMode": 2}}),
+        )
+        mock_api.post(
+            self._regex(leverage_url),
+            body=json.dumps({"code": 0, "msg": "success",
+                             "data": {"symbol": self.symbol, "leverage": "7", "marginMode": 2}}),
+        )
         success, msg = await self.exchange._set_trading_pair_leverage(self.trading_pair, 7)
         self.assertTrue(success)
         self.assertEqual("", msg)
+
+        margin_body = json.loads(self._last_request_body(mock_api, margin_url))
+        self.assertEqual(self.symbol, margin_body["symbol"])
+        self.assertEqual(CONSTANTS.MARGIN_MODE_ISOLATED, margin_body["marginMode"])
+
+        leverage_body = json.loads(self._last_request_body(mock_api, leverage_url))
+        self.assertEqual(self.symbol, leverage_body["symbol"])
+        self.assertEqual("7", leverage_body["leverage"])
+        self.assertEqual(CONSTANTS.MARGIN_MODE_ISOLATED, leverage_body["marginMode"])
+
+    @aioresponses()
+    async def test_set_trading_pair_leverage_returns_error_on_margin_mode_failure(self, mock_api):
+        margin_url = web_utils.private_rest_url(CONSTANTS.ACCOUNT_MARGIN_MODE_PATH_URL, domain=self.domain)
+        mock_api.post(
+            self._regex(margin_url),
+            body=json.dumps({"code": 8012, "message": "保证金模式异常"}),
+        )
+        success, msg = await self.exchange._set_trading_pair_leverage(self.trading_pair, 7)
+        self.assertFalse(success)
+        self.assertIn("保证金模式异常", msg)
+
+    @aioresponses()
+    async def test_set_trading_pair_leverage_returns_error_on_failure(self, mock_api):
+        margin_url = web_utils.private_rest_url(CONSTANTS.ACCOUNT_MARGIN_MODE_PATH_URL, domain=self.domain)
+        leverage_url = web_utils.private_rest_url(CONSTANTS.ACCOUNT_LEVERAGE_PATH_URL, domain=self.domain)
+        mock_api.post(
+            self._regex(margin_url),
+            body=json.dumps({"code": 0, "msg": "success",
+                             "data": {"symbol": self.symbol, "marginMode": 2}}),
+        )
+        mock_api.post(
+            self._regex(leverage_url),
+            body=json.dumps({"code": 8011, "message": "杠杆异常"}),
+        )
+        success, msg = await self.exchange._set_trading_pair_leverage(self.trading_pair, 999)
+        self.assertFalse(success)
+        self.assertIn("杠杆异常", msg)
 
     async def test_trading_pair_position_mode_set_oneway_succeeds(self):
         success, _ = await self.exchange._trading_pair_position_mode_set(PositionMode.ONEWAY, self.trading_pair)

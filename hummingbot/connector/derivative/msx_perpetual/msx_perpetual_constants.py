@@ -64,6 +64,9 @@ KLINE_PATH_URL = "/kline"                 # GET /kline
 TICKER_PATH_URL = "/ticker"               # GET /ticker/{symbol}
 PRICE_STEPS_PATH_URL = "/price-steps"     # GET /price-steps/{symbol}
 
+# 市场数据(公开, GET) — v1.1 新增: 合约产品列表 (交易规则来源)
+PRODUCTS_PATH_URL = "/products"           # GET /products[?type=]
+
 # 订单/持仓(私有, POST, 需签名)
 ORDER_CREATE_PATH_URL = "/order/create"
 ORDER_CANCEL_PATH_URL = "/order/cancel"
@@ -72,6 +75,11 @@ ORDER_HISTORY_PATH_URL = "/order/history"
 ORDER_ENTRUST_HISTORY_PATH_URL = "/order/entrust-history"
 POSITION_CURRENT_PATH_URL = "/position/current"
 POSITION_HISTORY_PATH_URL = "/position/history"
+
+# 账户设置 — v1.1 新增 (设置杠杆/保证金模式; 下单不再传 marginMode)
+ACCOUNT_CONFIG_PATH_URL = "/account/config"        # GET  /account/config?symbol=  (私有)
+ACCOUNT_MARGIN_MODE_PATH_URL = "/account/margin-mode"  # POST 修改保证金模式(改保证金模式唯一入口)
+ACCOUNT_LEVERAGE_PATH_URL = "/account/leverage"    # POST 修改杠杆(必填 marginMode 字段, 但实测不会改保证金模式)
 
 # 限流标识(用于 throttler)
 LIMIT_ID_PUBLIC = "PUBLIC"
@@ -138,6 +146,8 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PUBLIC), LinkedLimitWeightPair("PUBLIC_RPS")]),
     RateLimit(limit_id=PRICE_STEPS_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PUBLIC), LinkedLimitWeightPair("PUBLIC_RPS")]),
+    RateLimit(limit_id=PRODUCTS_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PUBLIC), LinkedLimitWeightPair("PUBLIC_RPS")]),
     RateLimit(limit_id=ORDER_CREATE_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
     RateLimit(limit_id=ORDER_CANCEL_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
@@ -152,11 +162,17 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
     RateLimit(limit_id=POSITION_HISTORY_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
+    RateLimit(limit_id=ACCOUNT_CONFIG_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
+    RateLimit(limit_id=ACCOUNT_MARGIN_MODE_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
+    RateLimit(limit_id=ACCOUNT_LEVERAGE_PATH_URL, limit=MAX_RPM, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
 ]
 
-# 成功码: 私有(订单/持仓)接口返回 code==200; 公共行情接口返回 code==0。
-# 两者都表示成功(实测测试环境), 用集合统一判定。
-SUCCESS_CODE = 200
+# 成功码: v1.1 起所有接口(公共+私有)统一返回 code==0 (实测生产 2026-06 全部为 0)。
+# 旧版私有接口曾返回 200; 集合同时容忍 200 以兼容过渡期/历史数据。
+SUCCESS_CODE = 0
 SUCCESS_CODES = (0, 200)
 
 # Cloudflare 会拦默认 Python UA, 所有请求需带浏览器 User-Agent。

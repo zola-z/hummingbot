@@ -263,6 +263,8 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         is_close = position_action == PositionAction.CLOSE
         open_type = CONSTANTS.OPEN_TYPE_CLOSE if is_close else CONSTANTS.OPEN_TYPE_OPEN
 
+        # v1.1: /order/create 不再接受 marginMode。保证金模式由账户配置决定,
+        # 通过 _set_trading_pair_leverage -> POST /account/leverage 预先设为逐仓。
         api_params: Dict[str, Any] = {
             "symbol": symbol,
             "coType": CONSTANTS.DEFAULT_CO_TYPE,
@@ -270,7 +272,6 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
             "openType": open_type,
             "side": side,
             "vol": f"{amount:f}",
-            "marginMode": CONSTANTS.DEFAULT_MARGIN_MODE,
             "triggerType": CONSTANTS.TRIGGER_NORMAL,
         }
         if order_type.is_limit_type():
@@ -299,8 +300,8 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         self._raise_on_error(order_result)
         transact_time = time.time()
 
-        # MSX 测试环境的下单成功响应只返回 {code, message}, 不含 data.orderId
-        # (文档说返回 data.orderId, 实测无)。若有则直接用, 否则回查最新订单匹配。
+        # v1.1 文档称下单响应返回 data.orderId, 但生产实测(2026-06)仍为 data:null,
+        # 需回查最新订单匹配。若服务端后续修复直接返回 orderId, 此处会优先采用。
         data = order_result.get("data") if isinstance(order_result, dict) else None
         if isinstance(data, dict) and data.get("orderId") is not None:
             return str(data["orderId"]), transact_time
@@ -581,8 +582,36 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
     # ------------------------------------------------------ leverage / margin
 
     async def _set_trading_pair_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
-        # MSX has no set-leverage endpoint; leverage is supplied per order on open. Store it locally.
-        return True, ""
+        # v1.1: orders no longer carry marginMode, so the account config must be set to ISOLATED here.
+        # IMPORTANT: POST /account/leverage requires a marginMode field but does NOT actually change
+        # the margin mode (实测确认). Margin mode can only be changed via POST /account/margin-mode.
+        # Therefore set the margin mode first, then the leverage.
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+
+        margin_response = await self._api_post(
+            path_url=CONSTANTS.ACCOUNT_MARGIN_MODE_PATH_URL,
+            data={"symbol": symbol, "marginMode": CONSTANTS.DEFAULT_MARGIN_MODE},
+            is_auth_required=True,
+            return_err=True)
+        if not self._is_success(margin_response):
+            message = (margin_response.get("message") or margin_response.get("msg")
+                       if isinstance(margin_response, dict) else str(margin_response))
+            return False, f"MSX set margin mode failed: {message}"
+
+        leverage_response = await self._api_post(
+            path_url=CONSTANTS.ACCOUNT_LEVERAGE_PATH_URL,
+            data={
+                "symbol": symbol,
+                "leverage": str(leverage),
+                "marginMode": CONSTANTS.DEFAULT_MARGIN_MODE,  # required field, ignored by server
+            },
+            is_auth_required=True,
+            return_err=True)
+        if self._is_success(leverage_response):
+            return True, ""
+        message = (leverage_response.get("message") or leverage_response.get("msg")
+                   if isinstance(leverage_response, dict) else str(leverage_response))
+        return False, f"MSX set leverage failed: {message}"
 
     async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
         if mode != PositionMode.ONEWAY:
