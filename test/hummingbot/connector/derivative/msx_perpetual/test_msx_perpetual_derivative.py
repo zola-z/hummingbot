@@ -777,6 +777,76 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertLessEqual(history_calls, 1, "/order/history 至多 1 次")
 
     @aioresponses()
+    async def test_snapshot_fetch_failure_falls_back_not_gone(self, mock_api):
+        """某 symbol 列表拉取失败(429): 该 symbol 记入 failed_symbols, 查询回退逐订单, 不误判订单消失。"""
+        self.exchange._last_poll_timestamp = 0
+        self.exchange._set_current_timestamp(1640780000 + 100)
+        self._track_open_buy(order_id="OID1", exchange_order_id="8886774")
+
+        limit_url = web_utils.private_rest_url(CONSTANTS.ORDER_LIMIT_PATH_URL, domain=self.domain)
+        history_url = web_utils.private_rest_url(CONSTANTS.ORDER_HISTORY_PATH_URL, domain=self.domain)
+        # 快照阶段: limit 返回 429(失败) -> symbol 进 failed_symbols。
+        # 回退阶段(逐订单): limit 命中该订单 -> 正常状态更新, 不 not-found。
+        # 注: 一轮内回退会被调用多次(fills 通道 + status 通道各查一次 /order/limit),
+        # 故成功回退响应用 repeat=True 让每次回退都命中该订单(aioresponses 先消费 429,
+        # 再持续返回成功)。
+        mock_api.post(self._regex(limit_url), body=json.dumps({"code": 429, "msg": "rate limited"}))
+        mock_api.post(self._regex(history_url),
+                      body=json.dumps({"code": 0, "msg": "success", "data": []}), repeat=True)
+        mock_api.post(
+            self._regex(limit_url),
+            body=json.dumps({"code": 0, "msg": "success",
+                             "data": [{"id": 8886774, "symbol": self.symbol, "status": 1,
+                                       "filledVol": "0", "avgPrice": "0", "ctime": 1}]}),
+            repeat=True,
+        )
+
+        called = {"not_found": 0}
+        orig = self.exchange._order_tracker.process_order_not_found
+
+        async def spy_not_found(cid):
+            called["not_found"] += 1
+            return await orig(cid)
+
+        self.exchange._order_tracker.process_order_not_found = spy_not_found  # type: ignore
+
+        # failed_symbols 在 _update_order_status 的 finally 里被清空, 故在快照构建后、finally 前
+        # 探测(见 brief Step 3 备选), 捕获该 symbol 确实进入了 failed_symbols。
+        seen_failed = {"symbols": None}
+        orig_snapshot = self.exchange._build_order_status_snapshot
+
+        async def spy_snapshot(orders):
+            await orig_snapshot(orders)
+            seen_failed["symbols"] = set(self.exchange._order_status_cache_failed_symbols)
+
+        self.exchange._build_order_status_snapshot = spy_snapshot  # type: ignore
+
+        await self.exchange._update_order_status()
+        self.assertEqual(0, called["not_found"], "拉取失败不得误触发 not-found")
+        self.assertIn(self.symbol, seen_failed["symbols"],
+                      "列表拉取失败的 symbol 必须记入 failed_symbols(回退逐订单)")
+
+    @aioresponses()
+    async def test_snapshot_cleared_after_cycle(self, mock_api):
+        """一轮结束后快照必须清空(None), 不得跨轮复用陈旧数据。"""
+        self.exchange._last_poll_timestamp = 0
+        self.exchange._set_current_timestamp(1640780000 + 100)
+        self._track_open_buy(order_id="OID1", exchange_order_id="8886774")
+        limit_url = web_utils.private_rest_url(CONSTANTS.ORDER_LIMIT_PATH_URL, domain=self.domain)
+        history_url = web_utils.private_rest_url(CONSTANTS.ORDER_HISTORY_PATH_URL, domain=self.domain)
+        mock_api.post(self._regex(limit_url),
+                      body=json.dumps({"code": 0, "msg": "success",
+                                       "data": [{"id": 8886774, "symbol": self.symbol, "status": 1,
+                                                 "filledVol": "0", "avgPrice": "0", "ctime": 1}]}),
+                      repeat=True)
+        mock_api.post(self._regex(history_url),
+                      body=json.dumps({"code": 0, "msg": "success", "data": []}), repeat=True)
+
+        await self.exchange._update_order_status()
+        self.assertIsNone(self.exchange._order_status_cache, "轮末快照必须为 None")
+        self.assertEqual(set(), self.exchange._order_status_cache_failed_symbols)
+
+    @aioresponses()
     async def test_update_trading_rules_keeps_existing_on_fetch_failure(self, mock_api):
         """price-steps 请求失败(如 429)时不得清空已有 trading rules。
 
