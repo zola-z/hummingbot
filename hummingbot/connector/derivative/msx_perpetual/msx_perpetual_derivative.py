@@ -606,7 +606,15 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
             except Exception as e:
                 self.logger().error(f"Error fetching price steps for {trading_pair}: {e}", exc_info=True)
         trading_rules_list = await self._format_trading_rules(steps_by_pair)
-        self._trading_rules.clear()
+        # Do NOT wipe existing rules when the fetch failed (e.g. HTTP 429 rate limit) and returned
+        # nothing. The original code unconditionally cleared then rebuilt, so a transient failure
+        # left _trading_rules empty and every subsequent _create_order raised KeyError(trading_pair),
+        # crashing order placement and hedging. Only replace rules we actually obtained.
+        if not trading_rules_list:
+            self.logger().warning(
+                "MSX price-steps fetch yielded no trading rules this cycle (likely transient/rate-limited); "
+                "keeping existing trading rules.")
+            return
         for trading_rule in trading_rules_list:
             self._trading_rules[trading_rule.trading_pair] = trading_rule
         self._initialize_trading_pair_symbols_from_exchange_info(steps_by_pair)

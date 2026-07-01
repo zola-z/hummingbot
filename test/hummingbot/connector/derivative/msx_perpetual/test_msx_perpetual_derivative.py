@@ -619,6 +619,29 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("0.01"), rule.min_price_increment)
         self.assertEqual(Decimal("0.00000001"), rule.min_base_amount_increment)
 
+    @aioresponses()
+    async def test_update_trading_rules_keeps_existing_on_fetch_failure(self, mock_api):
+        """price-steps 请求失败(如 429)时不得清空已有 trading rules。
+
+        原 bug: _update_trading_rules 无条件 clear() 再重建; 拉取失败 -> rules 空 ->
+        后续 _create_order 的 self._trading_rules['BTC-USDT'] KeyError -> 下单/对冲崩溃。
+        """
+        # 先成功加载一次规则
+        self._simulate_trading_rules_initialized()
+        self.assertIn(self.trading_pair, self.exchange.trading_rules)
+
+        # 再次更新时 price-steps 返回 429(失败)
+        url = web_utils.public_rest_url(
+            CONSTANTS.PRICE_STEPS_PATH_URL + "/" + self.symbol, domain=self.domain
+        )
+        mock_api.get(self._regex(url), status=429, body=json.dumps({"code": 429, "msg": "rate limit"}))
+
+        await self.exchange._update_trading_rules()
+
+        # 拉取失败不应清空已有规则(否则下单会 KeyError)。
+        self.assertIn(self.trading_pair, self.exchange.trading_rules)
+        self.assertEqual(Decimal("0.01"), self.exchange.trading_rules[self.trading_pair].min_price_increment)
+
     async def test_initialize_symbol_map_from_configured_pairs(self):
         self.exchange._set_trading_pair_symbol_map(None)
         self.exchange._initialize_trading_pair_symbols_from_exchange_info({})
