@@ -1,7 +1,7 @@
 import asyncio
 import time
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from bidict import bidict
 
@@ -84,6 +84,15 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         # lock so a strategy placing buy+sell (or cancel+place) in the same tick never overlaps.
         # Serialization alone is enough; no artificial delay is needed (50ms-spaced serial calls pass).
         self._order_request_lock: Optional[asyncio.Lock] = None
+        # Per-cycle snapshot for order-status polling: {exchange_symbol: {order_id: order_dict}}.
+        # Populated at the top of _update_order_status so the fills path and the status path share a
+        # single /order/limit + /order/history fetch per symbol instead of one lookup per order
+        # (MSX rate-limits ~10 rps; the old per-order scan amplified requests ~4x M). None = disabled
+        # -> _locate_order_on_exchange falls back to per-order queries (direct calls / unit tests).
+        self._order_status_cache: Optional[Dict[str, Dict[int, Dict[str, Any]]]] = None
+        # Symbols whose list fetch failed this cycle: their lookups must fall back to per-order queries
+        # rather than treating a snapshot miss as "order gone" (which would wrongly fire not-found).
+        self._order_status_cache_failed_symbols: Set[str] = set()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -380,11 +389,21 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
 
         MSX has no "get single order" endpoint; returns None if found in neither.
         Shared by _request_order_status and _all_trade_updates_for_order.
+
+        When a per-cycle snapshot is populated (see _update_order_status), read from it instead of
+        issuing requests: the snapshot holds the FULL /order/limit + /order/history lists for the
+        symbol, so a hit returns the order and a miss means the order is genuinely absent. Symbols
+        whose fetch failed this cycle fall back to per-order queries (a miss there is "unknown", not
+        "gone").
         """
         exchange_order_id = await tracked_order.get_exchange_order_id()
         target_id = int(exchange_order_id)
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
 
+        if self._order_status_cache is not None and symbol not in self._order_status_cache_failed_symbols:
+            return self._order_status_cache.get(symbol, {}).get(target_id)
+
+        # Fallback: no snapshot this cycle (direct call / unit test) or this symbol's fetch failed.
         # 1) current open orders (status 0/1/3) via /order/limit
         open_orders = await self._api_post(
             path_url=CONSTANTS.ORDER_LIMIT_PATH_URL,

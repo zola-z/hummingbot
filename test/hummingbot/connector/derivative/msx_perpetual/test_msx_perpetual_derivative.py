@@ -712,6 +712,26 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("0.01"), rule.min_price_increment)
         self.assertEqual(Decimal("0.00000001"), rule.min_base_amount_increment)
 
+    # ---- batch snapshot (order-status poll dedup) -----------------------------
+
+    async def test_locate_reads_snapshot_without_api_call(self):
+        """填充快照后, _locate_order_on_exchange 命中即返回, 不得发任何请求。"""
+        tracked = self._track_open_buy(order_id="OID1", exchange_order_id="8886774")
+        order_dict = {"id": 8886774, "symbol": self.symbol, "status": 3, "ctime": 1640780000000}
+        self.exchange._order_status_cache = {self.symbol: {8886774: order_dict}}
+        self.exchange._order_status_cache_failed_symbols = set()
+
+        called = {"n": 0}
+
+        async def boom(*a, **k):
+            called["n"] += 1
+            raise AssertionError("must not call _api_post when snapshot is populated")
+
+        self.exchange._api_post = boom  # type: ignore
+        match = await self.exchange._locate_order_on_exchange(tracked)
+        self.assertEqual(order_dict, match)
+        self.assertEqual(0, called["n"])
+
     @aioresponses()
     async def test_update_trading_rules_keeps_existing_on_fetch_failure(self, mock_api):
         """price-steps 请求失败(如 429)时不得清空已有 trading rules。
