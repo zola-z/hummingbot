@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from decimal import Decimal
@@ -442,6 +443,46 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(OrderState.FILLED, order_update.new_state)
         self.assertEqual("8886774", order_update.exchange_order_id)
 
+    # ---- order request serialization (MSX rejects concurrent order requests) --
+
+    async def test_place_order_serialized_no_concurrent_api_calls(self):
+        """MSX 不允许并发下单(并发 3+ -> 1006)。connector 必须串行化下单请求。
+
+        本测试: 两个并发 _place_order, 用 _api_post 打点检测是否有请求重叠(并发)。
+        修复前(无锁)会重叠 -> max_concurrent==2; 修复后(有锁)串行 -> max_concurrent==1。
+        """
+        import asyncio
+
+        self._simulate_trading_rules_initialized()
+        self.exchange._perpetual_trading.set_leverage(self.trading_pair, 1)
+
+        in_flight = 0
+        max_concurrent = 0
+
+        async def fake_api_post(*args, **kwargs):
+            nonlocal in_flight, max_concurrent
+            in_flight += 1
+            max_concurrent = max(max_concurrent, in_flight)
+            await asyncio.sleep(0.05)  # 模拟网络往返, 制造重叠窗口
+            in_flight -= 1
+            return {"code": 0, "msg": "success", "data": {"orderId": 111, "orderNo": "N"}}
+
+        self.exchange._api_post = fake_api_post  # type: ignore
+
+        async def one(side):
+            return await self.exchange._place_order(
+                order_id=f"OID_{side}",
+                trading_pair=self.trading_pair,
+                amount=Decimal("0.001"),
+                trade_type=side,
+                order_type=OrderType.LIMIT,
+                price=Decimal("30000"),
+                position_action=PositionAction.OPEN,
+            )
+
+        await asyncio.gather(one(TradeType.BUY), one(TradeType.SELL))
+        self.assertEqual(1, max_concurrent, "下单请求必须串行, 不得并发(MSX 会 1006)")
+
     # ---- trade updates (fill synthesis, no per-trade endpoint) ----------------
 
     def _track_open_buy(self, order_id="OID1", exchange_order_id="8886774", amount="1"):
@@ -457,6 +498,31 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             position_action=PositionAction.OPEN,
         )
         return self.exchange.in_flight_orders[order_id]
+
+    async def test_all_trade_updates_returns_empty_when_no_exchange_order_id(self):
+        """订单尚未拿到 exchange_order_id 时, 不得阻塞等待(会超时 CancelledError), 直接返回 []。
+
+        原 bug: _locate_order_on_exchange 调 get_exchange_order_id() 会阻塞等待未就绪的
+        exchange_order_id, 轮询超时 -> CancelledError -> fill 通道失败 -> 成交感知失效。
+        MSX 下单返回 data:null 需回查, orderId 有延迟, 这种订单很常见。
+        """
+        self.exchange.start_tracking_order(
+            order_id="OID_NOID",
+            exchange_order_id=None,  # 尚未确认
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("30000"),
+            amount=Decimal("1"),
+            order_type=OrderType.LIMIT,
+            leverage=1,
+            position_action=PositionAction.OPEN,
+        )
+        tracked = self.exchange.in_flight_orders["OID_NOID"]
+        # 不应阻塞、不应抛异常, 直接空(下轮 orderId 就绪后再处理)。
+        updates = await asyncio.wait_for(
+            self.exchange._all_trade_updates_for_order(tracked), timeout=1.0
+        )
+        self.assertEqual([], updates)
 
     @aioresponses()
     async def test_all_trade_updates_synthesizes_fill_from_aggregate(self, mock_api):
@@ -598,6 +664,33 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         await self.exchange._update_order_status()
         # 成交量已经过 TradeUpdate 记入(证明 fills 通道被调用)。
         self.assertEqual(Decimal("1"), tracked.executed_amount_base)
+
+    async def test_update_order_status_runs_fills_from_fillable_not_active(self):
+        """fills 通道须以 all_fillable_orders 为准且仅受 tick 节流, 不得被 active 判空 gate。
+
+        原 bug: _update_order_status 在 'len(active_orders)==0 -> return' 之后才调 fills。
+        成交完的订单离开 active 进 cached, 若某轮 active 为空(挂单全成交)则 fills 被跳过,
+        成交永不被检测。本测试放一个 fillable 订单并把 active 清空, 验证 fills 仍运行。
+        """
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000 + 1000)  # 放行 tick 节流
+
+        self._track_open_buy(order_id="OID_FILL", exchange_order_id="999")
+        tracked = self.exchange._order_tracker.active_orders.pop("OID_FILL")
+        # 移到 cached: 已离开 active 但仍属 all_fillable。
+        self.exchange._order_tracker._cached_orders["OID_FILL"] = tracked
+        self.assertEqual(0, len(self.exchange._order_tracker.active_orders))
+        self.assertIn("OID_FILL", self.exchange._order_tracker.all_fillable_orders)
+
+        seen = {"orders": None}
+
+        async def spy_fills(orders):
+            seen["orders"] = list(orders)
+
+        self.exchange._update_orders_fills = spy_fills  # type: ignore
+        await self.exchange._update_order_status()
+        self.assertIsNotNone(seen["orders"], "active 为空时 fills 仍须运行")
+        self.assertIn(tracked, seen["orders"])
 
     # ---- trading rules & symbol map -------------------------------------------
 

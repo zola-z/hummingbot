@@ -52,8 +52,11 @@ DEFAULT_LEVERAGE = 1
 
 class MsxPerpetualDerivative(PerpetualDerivativePyBase):
     web_utils = web_utils
-    SHORT_POLL_INTERVAL = 5.0
-    UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+    # MSX rate-limits aggressively (empirically ~10 rps globally before HTTP 429). Order status /
+    # fills polling scans /order/limit + /order/history per order, so keep the polling cadence low
+    # to stay well under the limit. (A batch lookup that scans once for all orders is a follow-up.)
+    SHORT_POLL_INTERVAL = 12.0
+    UPDATE_ORDER_STATUS_MIN_INTERVAL = 12.0
     LONG_POLL_INTERVAL = 120.0
 
     def __init__(
@@ -76,7 +79,19 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         # Cache of current position ids keyed by (exchange_symbol, PositionSide); used to build
         # the ``posId`` required when closing a position via /order/create.
         self._position_id_by_symbol_side: Dict[Tuple[str, PositionSide], int] = {}
+        # MSX rejects concurrent order requests (empirically: 2 concurrent OK, 3+ -> code 1006
+        # "Request too frequent"). Serialize all /order/create and /order/cancel calls through this
+        # lock so a strategy placing buy+sell (or cancel+place) in the same tick never overlaps.
+        # Serialization alone is enough; no artificial delay is needed (50ms-spaced serial calls pass).
+        self._order_request_lock: Optional[asyncio.Lock] = None
         super().__init__(balance_asset_limit, rate_limits_share_pct)
+
+    @property
+    def order_request_lock(self) -> asyncio.Lock:
+        # Lazily created so it binds to the running event loop.
+        if self._order_request_lock is None:
+            self._order_request_lock = asyncio.Lock()
+        return self._order_request_lock
 
     @property
     def name(self) -> str:
@@ -293,20 +308,23 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
             # leverage is mandatory on open; MSX takes it per order (no set-leverage endpoint).
             api_params["leverage"] = str(self._leverage_for(trading_pair))
 
-        order_result = await self._api_post(
-            path_url=CONSTANTS.ORDER_CREATE_PATH_URL,
-            data=api_params,
-            is_auth_required=True)
-        self._raise_on_error(order_result)
-        transact_time = time.time()
+        # Serialize the order request: MSX rejects concurrent /order/create (3+ in flight -> 1006).
+        # The lock also covers the follow-up orderId lookup so a concurrent placement can't interleave.
+        async with self.order_request_lock:
+            order_result = await self._api_post(
+                path_url=CONSTANTS.ORDER_CREATE_PATH_URL,
+                data=api_params,
+                is_auth_required=True)
+            self._raise_on_error(order_result)
+            transact_time = time.time()
 
-        # v1.1 文档称下单响应返回 data.orderId, 但生产实测(2026-06)仍为 data:null,
-        # 需回查最新订单匹配。若服务端后续修复直接返回 orderId, 此处会优先采用。
-        data = order_result.get("data") if isinstance(order_result, dict) else None
-        if isinstance(data, dict) and data.get("orderId") is not None:
-            return str(data["orderId"]), transact_time
-        o_id = await self._resolve_new_order_id(symbol, side, open_type)
-        return o_id, transact_time
+            # v1.1 文档称下单响应返回 data.orderId, 但生产实测(2026-06)仍为 data:null,
+            # 需回查最新订单匹配。若服务端后续修复直接返回 orderId, 此处会优先采用。
+            data = order_result.get("data") if isinstance(order_result, dict) else None
+            if isinstance(data, dict) and data.get("orderId") is not None:
+                return str(data["orderId"]), transact_time
+            o_id = await self._resolve_new_order_id(symbol, side, open_type)
+            return o_id, transact_time
 
     async def _resolve_new_order_id(self, symbol: str, side: int, open_type: int) -> str:
         """下单成功但响应无 orderId 时, 回查最新一笔匹配订单的 id。
@@ -348,11 +366,13 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         exchange_order_id = await tracked_order.get_exchange_order_id()
         api_params = {"orderId": int(exchange_order_id)}
-        cancel_result = await self._api_post(
-            path_url=CONSTANTS.ORDER_CANCEL_PATH_URL,
-            data=api_params,
-            is_auth_required=True,
-            return_err=True)
+        # Serialize with order placement: cancel + place in the same tick must not overlap (MSX 1006).
+        async with self.order_request_lock:
+            cancel_result = await self._api_post(
+                path_url=CONSTANTS.ORDER_CANCEL_PATH_URL,
+                data=api_params,
+                is_auth_required=True,
+                return_err=True)
         return self._is_success(cancel_result)
 
     async def _locate_order_on_exchange(self, tracked_order: InFlightOrder) -> Optional[Dict[str, Any]]:
@@ -389,6 +409,14 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         # not by itself emit a fill. So we must synthesize a TradeUpdate from the aggregate data:
         # emit ONE TradeUpdate for the *increment* since the last poll (cumulative_filled minus the
         # already-recorded executed_amount_base), with a stable trade_id for dedup.
+        #
+        # Skip orders that don't yet have an exchange_order_id: MSX returns data:null on create so
+        # the orderId is resolved by a follow-up lookup and may lag. Calling get_exchange_order_id()
+        # here would BLOCK on the id-update event and get cancelled by the poll timeout, which
+        # surfaced as "Failed to fetch trade updates ... CancelledError" and broke fill detection.
+        # The next poll (after the id is set) will pick up the fill.
+        if order.exchange_order_id is None:
+            return []
         match = await self._locate_order_on_exchange(order)
         if match is None:
             return []
@@ -451,15 +479,21 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
     async def _update_order_status(self):
         last_tick = int(self._last_poll_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL)
         current_tick = int(self.current_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL)
-        tracked_orders = list(self._order_tracker.active_orders.values())
-        if current_tick <= last_tick or len(tracked_orders) == 0:
+        if current_tick <= last_tick:
             return
-        # Fills FIRST: MSX has no user stream, so trade updates only come from polling the aggregate
-        # avgPrice/filledVol here. Without this, did_fill_order / OrderFilledEvent never fires and
-        # hedging never triggers. Run fills before status so a fill is recorded before the order is
-        # marked FILLED (avoids _process_order_update's wait_until_completely_filled timeout).
-        await self._update_orders_fills(orders=list(self._order_tracker.all_fillable_orders.values()))
 
+        # Fills FIRST, and gated ONLY by the tick throttle (not by active_orders): a filled order
+        # leaves active_orders and moves to cached, so keying the fills poll off active_orders meant
+        # that once all resting quotes filled (active empty) fills were never polled and the trade
+        # was never detected. all_fillable_orders includes active + cached + lost.
+        # MSX has no user stream, so trade updates only come from polling aggregate avgPrice/filledVol.
+        fillable = list(self._order_tracker.all_fillable_orders.values())
+        if fillable:
+            await self._update_orders_fills(orders=fillable)
+
+        tracked_orders = list(self._order_tracker.active_orders.values())
+        if len(tracked_orders) == 0:
+            return
         tasks = [self._request_order_status(order) for order in tracked_orders]
         results = await safe_gather(*tasks, return_exceptions=True)
         for order_update, tracked_order in zip(results, tracked_orders):
