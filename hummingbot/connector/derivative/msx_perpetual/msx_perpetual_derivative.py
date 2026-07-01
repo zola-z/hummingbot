@@ -355,13 +355,12 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
             return_err=True)
         return self._is_success(cancel_result)
 
-    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
-        # MSX exposes fills only through aggregate avgPrice/filledVol on /order/history and
-        # /order/entrust-history (no per-trade fills endpoint). Fills are folded into the
-        # OrderUpdate produced by _request_order_status, so there are no granular trade updates.
-        return []
+    async def _locate_order_on_exchange(self, tracked_order: InFlightOrder) -> Optional[Dict[str, Any]]:
+        """Find the exchange order dict by scanning /order/limit then /order/history.
 
-    async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+        MSX has no "get single order" endpoint; returns None if found in neither.
+        Shared by _request_order_status and _all_trade_updates_for_order.
+        """
         exchange_order_id = await tracked_order.get_exchange_order_id()
         target_id = int(exchange_order_id)
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
@@ -381,6 +380,60 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
                 is_auth_required=True,
                 return_err=True)
             match = self._find_order(history, target_id)
+        return match
+
+    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+        # MSX has no per-trade fills endpoint; it only exposes aggregate avgPrice + cumulative
+        # filledVol on /order/limit and /order/history. HB's did_fill_order / OrderFilledEvent is
+        # driven ONLY by TradeUpdate (process_trade_update); an OrderUpdate reaching FILLED does
+        # not by itself emit a fill. So we must synthesize a TradeUpdate from the aggregate data:
+        # emit ONE TradeUpdate for the *increment* since the last poll (cumulative_filled minus the
+        # already-recorded executed_amount_base), with a stable trade_id for dedup.
+        match = await self._locate_order_on_exchange(order)
+        if match is None:
+            return []
+
+        cumulative_filled = Decimal(str(match.get("filledVol") or "0"))
+        already_recorded = order.executed_amount_base
+        increment = cumulative_filled - already_recorded
+        if increment <= Decimal("0"):
+            return []
+
+        avg_price = Decimal(str(match.get("avgPrice") or "0"))
+        if avg_price <= Decimal("0"):
+            # Cannot value the fill without a price; skip until avgPrice is populated.
+            return []
+
+        ts_ms = match.get("tradedTime") or match.get("ctime") or self.current_timestamp * 1e3
+        exchange_order_id = str(match["id"])
+        fee = self._get_fee(
+            base_currency=order.base_asset,
+            quote_currency=order.quote_asset,
+            order_type=order.order_type,
+            order_side=order.trade_type,
+            position_action=order.position,
+            amount=increment,
+            price=avg_price,
+            is_maker=True,
+        )
+        trade_update = TradeUpdate(
+            # Stable + monotonic in cumulative fill -> update_with_trade_update dedups by trade_id,
+            # so re-polling the same cumulative amount will not double-count.
+            trade_id=f"{exchange_order_id}-{cumulative_filled}",
+            client_order_id=order.client_order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=order.trading_pair,
+            fill_timestamp=float(ts_ms) * 1e-3,
+            fill_price=avg_price,
+            fill_base_amount=increment,
+            fill_quote_amount=increment * avg_price,
+            fee=fee,
+        )
+        return [trade_update]
+
+    async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+        exchange_order_id = await tracked_order.get_exchange_order_id()
+        match = await self._locate_order_on_exchange(tracked_order)
 
         if match is None:
             raise IOError(f"ORDER_NOT_FOUND: order {exchange_order_id} not found on MSX.")
@@ -401,6 +454,12 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         tracked_orders = list(self._order_tracker.active_orders.values())
         if current_tick <= last_tick or len(tracked_orders) == 0:
             return
+        # Fills FIRST: MSX has no user stream, so trade updates only come from polling the aggregate
+        # avgPrice/filledVol here. Without this, did_fill_order / OrderFilledEvent never fires and
+        # hedging never triggers. Run fills before status so a fill is recorded before the order is
+        # marked FILLED (avoids _process_order_update's wait_until_completely_filled timeout).
+        await self._update_orders_fills(orders=list(self._order_tracker.all_fillable_orders.values()))
+
         tasks = [self._request_order_status(order) for order in tracked_orders]
         results = await safe_gather(*tasks, return_exceptions=True)
         for order_update, tracked_order in zip(results, tracked_orders):

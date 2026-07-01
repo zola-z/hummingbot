@@ -442,6 +442,163 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(OrderState.FILLED, order_update.new_state)
         self.assertEqual("8886774", order_update.exchange_order_id)
 
+    # ---- trade updates (fill synthesis, no per-trade endpoint) ----------------
+
+    def _track_open_buy(self, order_id="OID1", exchange_order_id="8886774", amount="1"):
+        self.exchange.start_tracking_order(
+            order_id=order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("30000"),
+            amount=Decimal(amount),
+            order_type=OrderType.LIMIT,
+            leverage=1,
+            position_action=PositionAction.OPEN,
+        )
+        return self.exchange.in_flight_orders[order_id]
+
+    @aioresponses()
+    async def test_all_trade_updates_synthesizes_fill_from_aggregate(self, mock_api):
+        """MSX 无逐笔成交端点: 从 /order/history 的 filledVol+avgPrice 合成 TradeUpdate。"""
+        tracked = self._track_open_buy(amount="1")
+        limit_url = web_utils.private_rest_url(CONSTANTS.ORDER_LIMIT_PATH_URL, domain=self.domain)
+        history_url = web_utils.private_rest_url(CONSTANTS.ORDER_HISTORY_PATH_URL, domain=self.domain)
+        mock_api.post(self._regex(limit_url), body=json.dumps({"code": 0, "msg": "success", "data": []}))
+        mock_api.post(
+            self._regex(history_url),
+            body=json.dumps(
+                {
+                    "code": 0,
+                    "msg": "success",
+                    "data": [
+                        {
+                            "id": 8886774,
+                            "symbol": self.symbol,
+                            "status": 2,
+                            "vol": "1",
+                            "filledVol": "1",
+                            "avgPrice": "30000",
+                            "tradedTime": 1640780500000,
+                        }
+                    ],
+                }
+            ),
+        )
+
+        updates = await self.exchange._all_trade_updates_for_order(tracked)
+        self.assertEqual(1, len(updates))
+        tu = updates[0]
+        self.assertEqual("8886774", tu.exchange_order_id)
+        self.assertEqual("OID1", tu.client_order_id)
+        self.assertEqual(Decimal("1"), tu.fill_base_amount)
+        self.assertEqual(Decimal("30000"), tu.fill_price)
+        self.assertEqual(Decimal("30000"), tu.fill_quote_amount)
+
+    @aioresponses()
+    async def test_all_trade_updates_empty_when_no_fill(self, mock_api):
+        """未成交(filledVol=0)不应合成 TradeUpdate。"""
+        tracked = self._track_open_buy(amount="1")
+        limit_url = web_utils.private_rest_url(CONSTANTS.ORDER_LIMIT_PATH_URL, domain=self.domain)
+        mock_api.post(
+            self._regex(limit_url),
+            body=json.dumps(
+                {
+                    "code": 0,
+                    "msg": "success",
+                    "data": [
+                        {"id": 8886774, "symbol": self.symbol, "status": 1,
+                         "vol": "1", "filledVol": "0", "avgPrice": "0", "ctime": 1640780000000}
+                    ],
+                }
+            ),
+        )
+
+        updates = await self.exchange._all_trade_updates_for_order(tracked)
+        self.assertEqual([], updates)
+
+    @aioresponses()
+    async def test_all_trade_updates_only_increment_after_partial(self, mock_api):
+        """已记 0.4, 交易所累计 filledVol=1.0 -> 只合成增量 0.6。"""
+        tracked = self._track_open_buy(amount="1")
+        tracked.executed_amount_base = Decimal("0.4")  # 本地已记账
+        limit_url = web_utils.private_rest_url(CONSTANTS.ORDER_LIMIT_PATH_URL, domain=self.domain)
+        history_url = web_utils.private_rest_url(CONSTANTS.ORDER_HISTORY_PATH_URL, domain=self.domain)
+        mock_api.post(self._regex(limit_url), body=json.dumps({"code": 0, "msg": "success", "data": []}))
+        mock_api.post(
+            self._regex(history_url),
+            body=json.dumps(
+                {
+                    "code": 0,
+                    "msg": "success",
+                    "data": [
+                        {"id": 8886774, "symbol": self.symbol, "status": 2,
+                         "vol": "1", "filledVol": "1", "avgPrice": "30000", "tradedTime": 1640780500000}
+                    ],
+                }
+            ),
+        )
+
+        updates = await self.exchange._all_trade_updates_for_order(tracked)
+        self.assertEqual(1, len(updates))
+        self.assertEqual(Decimal("0.6"), updates[0].fill_base_amount)
+
+    @aioresponses()
+    async def test_all_trade_updates_stable_trade_id_for_dedup(self, mock_api):
+        """trade_id 由 exchange_order_id + 累计成交量组成, 同一累计量下稳定(供去重)。"""
+        tracked = self._track_open_buy(amount="1")
+        history_body = json.dumps(
+            {
+                "code": 0,
+                "msg": "success",
+                "data": [
+                    {"id": 8886774, "symbol": self.symbol, "status": 2,
+                     "vol": "1", "filledVol": "1", "avgPrice": "30000", "tradedTime": 1640780500000}
+                ],
+            }
+        )
+        limit_url = web_utils.private_rest_url(CONSTANTS.ORDER_LIMIT_PATH_URL, domain=self.domain)
+        history_url = web_utils.private_rest_url(CONSTANTS.ORDER_HISTORY_PATH_URL, domain=self.domain)
+        mock_api.post(self._regex(limit_url), body=json.dumps({"code": 0, "msg": "success", "data": []}))
+        mock_api.post(self._regex(history_url), body=history_body)
+
+        updates = await self.exchange._all_trade_updates_for_order(tracked)
+        self.assertEqual("8886774-1", updates[0].trade_id)
+
+    @aioresponses()
+    async def test_update_order_status_records_fill_via_trade_update(self, mock_api):
+        """_update_order_status 必须调用 fills 通道, 使成交经 TradeUpdate 记入 executed_amount_base。
+
+        这是修复 did_fill_order 不触发的关键: 无此调用, 成交量永远不进 order tracker。
+        """
+        tracked = self._track_open_buy(amount="1")
+        # 让节流逻辑放行(current_tick > last_tick)。
+        self.exchange._last_poll_timestamp = 0
+        self.exchange._set_current_timestamp(1640780000 + 100)
+
+        limit_url = web_utils.private_rest_url(CONSTANTS.ORDER_LIMIT_PATH_URL, domain=self.domain)
+        history_url = web_utils.private_rest_url(CONSTANTS.ORDER_HISTORY_PATH_URL, domain=self.domain)
+        # 订单已成交, 出现在 history(不在 open orders)。fills 与 status 两条通道都会查。
+        mock_api.post(self._regex(limit_url), body=json.dumps({"code": 0, "msg": "success", "data": []}))
+        mock_api.post(
+            self._regex(history_url),
+            body=json.dumps(
+                {
+                    "code": 0,
+                    "msg": "success",
+                    "data": [
+                        {"id": 8886774, "symbol": self.symbol, "status": 2,
+                         "vol": "1", "filledVol": "1", "avgPrice": "30000", "tradedTime": 1640780500000}
+                    ],
+                }
+            ),
+        )
+
+        self.assertEqual(Decimal("0"), tracked.executed_amount_base)
+        await self.exchange._update_order_status()
+        # 成交量已经过 TradeUpdate 记入(证明 fills 通道被调用)。
+        self.assertEqual(Decimal("1"), tracked.executed_amount_base)
+
     # ---- trading rules & symbol map -------------------------------------------
 
     @aioresponses()
