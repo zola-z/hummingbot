@@ -37,3 +37,24 @@ class MsxPerpetualUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
+
+    async def test_last_recv_time_zero_before_start(self):
+        """未启动前 last_recv_time 应为 0(connector 尚未 ready)。"""
+        source = self._make_source()
+        self.assertEqual(source.last_recv_time, 0.0)
+
+    async def test_last_recv_time_positive_after_start(self):
+        """listen_for_user_stream 启动后 last_recv_time>0, 使 connector 能进入 ready。
+
+        这是 MSX 无用户流 WS 的 ready 修复关键: 无此项 user_stream_initialized
+        永远 False -> connector 永不 ready -> 策略不报价。
+        """
+        source = self._make_source()
+        self.assertEqual(source.last_recv_time, 0.0)
+        output: asyncio.Queue = asyncio.Queue()
+        task = asyncio.create_task(source.listen_for_user_stream(output))
+        await asyncio.sleep(0.05)
+        self.assertGreater(source.last_recv_time, 0.0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
