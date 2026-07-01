@@ -53,8 +53,9 @@ DEFAULT_LEVERAGE = 1
 class MsxPerpetualDerivative(PerpetualDerivativePyBase):
     web_utils = web_utils
     # MSX rate-limits aggressively (empirically ~10 rps globally before HTTP 429). Order status /
-    # fills polling scans /order/limit + /order/history per order, so keep the polling cadence low
-    # to stay well under the limit. (A batch lookup that scans once for all orders is a follow-up.)
+    # fills polling now scans /order/limit + /order/history ONCE per symbol per cycle via a per-cycle
+    # snapshot (see _build_order_status_snapshot / _update_order_status), shared by the fills and
+    # status paths, instead of one lookup per order. The polling cadence stays conservative anyway.
     SHORT_POLL_INTERVAL = 12.0
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 12.0
     LONG_POLL_INTERVAL = 120.0
