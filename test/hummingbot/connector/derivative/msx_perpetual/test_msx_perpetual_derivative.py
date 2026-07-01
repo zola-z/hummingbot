@@ -665,7 +665,8 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         # 成交量已经过 TradeUpdate 记入(证明 fills 通道被调用)。
         self.assertEqual(Decimal("1"), tracked.executed_amount_base)
 
-    async def test_update_order_status_runs_fills_from_fillable_not_active(self):
+    @aioresponses()
+    async def test_update_order_status_runs_fills_from_fillable_not_active(self, mock_api):
         """fills 通道须以 all_fillable_orders 为准且仅受 tick 节流, 不得被 active 判空 gate。
 
         原 bug: _update_order_status 在 'len(active_orders)==0 -> return' 之后才调 fills。
@@ -674,6 +675,14 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         """
         self._simulate_trading_rules_initialized()
         self.exchange._set_current_timestamp(1640780000 + 1000)  # 放行 tick 节流
+
+        # 轮首快照拉一次 /order/limit + /order/history(即使 active 为空), mock 之。
+        limit_url = web_utils.private_rest_url(CONSTANTS.ORDER_LIMIT_PATH_URL, domain=self.domain)
+        history_url = web_utils.private_rest_url(CONSTANTS.ORDER_HISTORY_PATH_URL, domain=self.domain)
+        mock_api.post(self._regex(limit_url),
+                      body=json.dumps({"code": 0, "msg": "success", "data": []}), repeat=True)
+        mock_api.post(self._regex(history_url),
+                      body=json.dumps({"code": 0, "msg": "success", "data": []}), repeat=True)
 
         self._track_open_buy(order_id="OID_FILL", exchange_order_id="999")
         tracked = self.exchange._order_tracker.active_orders.pop("OID_FILL")
@@ -731,6 +740,41 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         match = await self.exchange._locate_order_on_exchange(tracked)
         self.assertEqual(order_dict, match)
         self.assertEqual(0, called["n"])
+
+    @aioresponses()
+    async def test_update_order_status_batches_list_requests(self, mock_api):
+        """M 个同 symbol 订单一轮只拉一次 /order/limit + 一次 /order/history(共 2 次), 而非每订单各查。"""
+        self.exchange._last_poll_timestamp = 0
+        self.exchange._set_current_timestamp(1640780000 + 100)  # 放行 tick 节流
+        for i, oid in enumerate(("A", "B", "C")):
+            self._track_open_buy(order_id=oid, exchange_order_id=str(1000 + i))
+
+        limit_url = web_utils.private_rest_url(CONSTANTS.ORDER_LIMIT_PATH_URL, domain=self.domain)
+        history_url = web_utils.private_rest_url(CONSTANTS.ORDER_HISTORY_PATH_URL, domain=self.domain)
+        # 三个订单都在当前委托里(status 1 未成交)。
+        open_body = json.dumps({
+            "code": 0, "msg": "success",
+            "data": [
+                {"id": 1000, "symbol": self.symbol, "status": 1, "filledVol": "0", "avgPrice": "0", "ctime": 1},
+                {"id": 1001, "symbol": self.symbol, "status": 1, "filledVol": "0", "avgPrice": "0", "ctime": 1},
+                {"id": 1002, "symbol": self.symbol, "status": 1, "filledVol": "0", "avgPrice": "0", "ctime": 1},
+            ],
+        })
+        mock_api.post(self._regex(limit_url), body=open_body, repeat=True)
+        mock_api.post(self._regex(history_url),
+                      body=json.dumps({"code": 0, "msg": "success", "data": []}), repeat=True)
+
+        await self.exchange._update_order_status()
+
+        posts = [
+            (key[1].human_repr() if hasattr(key[1], "human_repr") else str(key[1]))
+            for key, calls in mock_api.requests.items() for _ in calls
+            if key[0] == "POST"
+        ]
+        limit_calls = sum(1 for u in posts if CONSTANTS.ORDER_LIMIT_PATH_URL in u)
+        history_calls = sum(1 for u in posts if CONSTANTS.ORDER_HISTORY_PATH_URL in u)
+        self.assertEqual(1, limit_calls, "3 个订单应只拉 1 次 /order/limit")
+        self.assertLessEqual(history_calls, 1, "/order/history 至多 1 次")
 
     @aioresponses()
     async def test_update_trading_rules_keeps_existing_on_fetch_failure(self, mock_api):

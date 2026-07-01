@@ -384,6 +384,46 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
                 return_err=True)
         return self._is_success(cancel_result)
 
+    async def _build_order_status_snapshot(self, orders: List[InFlightOrder]) -> None:
+        """Fetch the FULL /order/limit + /order/history lists once per symbol and cache them.
+
+        Called at the top of _update_order_status so both the fills and status paths reuse one
+        fetch per symbol (instead of one lookup per order). A symbol whose fetch fails is recorded in
+        _order_status_cache_failed_symbols so its lookups fall back to per-order queries.
+        """
+        symbols = set()
+        for order in orders:
+            if order.exchange_order_id is None:
+                continue
+            symbols.add(await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair))
+
+        for symbol in symbols:
+            open_orders = await self._api_post(
+                path_url=CONSTANTS.ORDER_LIMIT_PATH_URL,
+                data={"symbol": symbol, "coType": CONSTANTS.DEFAULT_CO_TYPE},
+                is_auth_required=True, return_err=True)
+            history = await self._api_post(
+                path_url=CONSTANTS.ORDER_HISTORY_PATH_URL,
+                data={"symbol": symbol, "coType": CONSTANTS.DEFAULT_CO_TYPE},
+                is_auth_required=True, return_err=True)
+            if not (self._is_success(open_orders) and self._is_success(history)):
+                # Unknown state for this symbol this cycle -> fall back to per-order queries.
+                self._order_status_cache_failed_symbols.add(symbol)
+                continue
+            by_id: Dict[int, Dict[str, Any]] = {}
+            # history first, then open orders override (open = current, more up to date).
+            for item in (history.get("data") or []):
+                try:
+                    by_id[int(item.get("id"))] = item
+                except (TypeError, ValueError):
+                    continue
+            for item in (open_orders.get("data") or []):
+                try:
+                    by_id[int(item.get("id"))] = item
+                except (TypeError, ValueError):
+                    continue
+            self._order_status_cache[symbol] = by_id
+
     async def _locate_order_on_exchange(self, tracked_order: InFlightOrder) -> Optional[Dict[str, Any]]:
         """Find the exchange order dict by scanning /order/limit then /order/history.
 
@@ -501,30 +541,40 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         if current_tick <= last_tick:
             return
 
-        # Fills FIRST, and gated ONLY by the tick throttle (not by active_orders): a filled order
-        # leaves active_orders and moves to cached, so keying the fills poll off active_orders meant
-        # that once all resting quotes filled (active empty) fills were never polled and the trade
-        # was never detected. all_fillable_orders includes active + cached + lost.
-        # MSX has no user stream, so trade updates only come from polling aggregate avgPrice/filledVol.
         fillable = list(self._order_tracker.all_fillable_orders.values())
-        if fillable:
-            await self._update_orders_fills(orders=fillable)
-
         tracked_orders = list(self._order_tracker.active_orders.values())
-        if len(tracked_orders) == 0:
-            return
-        tasks = [self._request_order_status(order) for order in tracked_orders]
-        results = await safe_gather(*tasks, return_exceptions=True)
-        for order_update, tracked_order in zip(results, tracked_orders):
-            client_order_id = tracked_order.client_order_id
-            if isinstance(order_update, Exception):
-                if self._is_order_not_found_during_status_update_error(order_update):
-                    await self._order_tracker.process_order_not_found(client_order_id)
-                else:
-                    self.logger().network(
-                        f"Error fetching status update for the order {client_order_id}: {order_update}.")
-                continue
-            self._order_tracker.process_order_update(order_update)
+
+        # Build a per-cycle snapshot so the fills path and the status path share one
+        # /order/limit + /order/history fetch per symbol (MSX rate-limits aggressively). Cleared in
+        # finally so no stale data ever leaks across cycles.
+        self._order_status_cache = {}
+        self._order_status_cache_failed_symbols = set()
+        try:
+            await self._build_order_status_snapshot(fillable + tracked_orders)
+
+            # Fills FIRST, gated ONLY by the tick throttle (not by active_orders): a filled order
+            # leaves active_orders for cached, so keying fills off active_orders would skip fills once
+            # all resting quotes filled. all_fillable_orders includes active + cached + lost.
+            if fillable:
+                await self._update_orders_fills(orders=fillable)
+
+            if len(tracked_orders) == 0:
+                return
+            tasks = [self._request_order_status(order) for order in tracked_orders]
+            results = await safe_gather(*tasks, return_exceptions=True)
+            for order_update, tracked_order in zip(results, tracked_orders):
+                client_order_id = tracked_order.client_order_id
+                if isinstance(order_update, Exception):
+                    if self._is_order_not_found_during_status_update_error(order_update):
+                        await self._order_tracker.process_order_not_found(client_order_id)
+                    else:
+                        self.logger().network(
+                            f"Error fetching status update for the order {client_order_id}: {order_update}.")
+                    continue
+                self._order_tracker.process_order_update(order_update)
+        finally:
+            self._order_status_cache = None
+            self._order_status_cache_failed_symbols = set()
 
     # --------------------------------------------------------------- balances
 
