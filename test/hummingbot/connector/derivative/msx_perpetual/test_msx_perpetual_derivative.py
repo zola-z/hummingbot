@@ -524,6 +524,37 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         )
         self.assertEqual([], updates)
 
+    async def test_request_order_status_no_exchange_order_id_raises_not_found(self):
+        """状态轮询路径与成交路径对称: 订单无 exchange_order_id 时不得阻塞等待。
+
+        原 bug: _request_order_status -> _locate_order_on_exchange 调 get_exchange_order_id()
+        对永远拿不到 orderId 的僵尸单(下单即 FAILED, id=None)阻塞 -> 轮询超时 CancelledError
+        (str 为空) -> 不含 ORDER_NOT_FOUND -> 跳过 process_order_not_found -> 无限刷
+        "Error fetching status update ...: ." 且僵尸单永不被清理。
+        修复: id 缺失时直接抛 ORDER_NOT_FOUND, 使上层走 process_order_not_found(累计计数
+        超阈标记 lost order 清理)。断言不阻塞(超时保护)且异常含 ORDER_NOT_FOUND。
+        """
+        self.exchange.start_tracking_order(
+            order_id="OID_ZOMBIE",
+            exchange_order_id=None,  # 下单即失败, 永不就绪
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("30000"),
+            amount=Decimal("1"),
+            order_type=OrderType.LIMIT,
+            leverage=1,
+            position_action=PositionAction.OPEN,
+        )
+        tracked = self.exchange.in_flight_orders["OID_ZOMBIE"]
+        with self.assertRaises(IOError) as ctx:
+            await asyncio.wait_for(
+                self.exchange._request_order_status(tracked), timeout=1.0
+            )
+        self.assertIn("ORDER_NOT_FOUND", str(ctx.exception))
+        self.assertTrue(
+            self.exchange._is_order_not_found_during_status_update_error(ctx.exception)
+        )
+
     @aioresponses()
     async def test_all_trade_updates_synthesizes_fill_from_aggregate(self, mock_api):
         """MSX 无逐笔成交端点: 从 /order/history 的 filledVol+avgPrice 合成 TradeUpdate。"""

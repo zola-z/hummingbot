@@ -520,6 +520,15 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         return [trade_update]
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+        # 与成交路径(_all_trade_updates_for_order)对称: 订单还没拿到 exchange_order_id 时
+        # 不得 await get_exchange_order_id() —— 它会阻塞等待 id-update 事件, 对下单即 FAILED
+        # 的僵尸单(id 永不就绪)会被轮询超时 cancel, 抛出 str 为空的 CancelledError, 既不含
+        # ORDER_NOT_FOUND 又无限刷 "Error fetching status update ...: ." 且僵尸单永不清理。
+        # 直接抛 ORDER_NOT_FOUND, 让上层走 process_order_not_found(累计计数超阈标记 lost order)。
+        if tracked_order.exchange_order_id is None:
+            raise IOError(
+                f"ORDER_NOT_FOUND: order {tracked_order.client_order_id} has no exchange order id yet."
+            )
         exchange_order_id = await tracked_order.get_exchange_order_id()
         match = await self._locate_order_on_exchange(tracked_order)
 
