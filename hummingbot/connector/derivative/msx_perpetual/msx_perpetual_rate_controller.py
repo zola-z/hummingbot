@@ -39,6 +39,7 @@ class AdaptiveRateController:
         self._backing_off_until = 0.0
         self._last_recovery_ts = self._now()
         self._last_grant_ts = 0.0
+        self._total_429 = 0
 
     @property
     def effective_rps(self) -> float:
@@ -49,6 +50,7 @@ class AdaptiveRateController:
         return self._now() < self._backing_off_until
 
     def on_429(self, retry_after: Optional[float] = None) -> None:
+        self._total_429 += 1
         self._probed_ceiling = self._effective_rps
         self._effective_rps = max(self._floor, self._effective_rps * self._decrease_factor)
         cooldown = retry_after if retry_after is not None else self._cooldown_s
@@ -89,4 +91,5 @@ class AdaptiveRateController:
             "effective_rps": self._effective_rps,
             "is_backing_off": self.is_backing_off,
             "probed_ceiling": self._probed_ceiling,
+            "total_429": self._total_429,
         }

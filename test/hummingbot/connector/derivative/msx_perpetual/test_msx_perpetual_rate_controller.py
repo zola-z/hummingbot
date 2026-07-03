@@ -196,3 +196,11 @@ def test_ceiling_100_allows_climb_not_hardcoded():
         c._maybe_recover()
     # 恢复上限 min(initial=90, probed 90*0.9=81)=81
     assert abs(c.effective_rps - 81.0) < 1e-9
+
+
+def test_snapshot_exposes_total_429_count():
+    c = _controller(FakeClock())
+    assert c.snapshot()["total_429"] == 0
+    c.on_429()
+    c.on_429()
+    assert c.snapshot()["total_429"] == 2
