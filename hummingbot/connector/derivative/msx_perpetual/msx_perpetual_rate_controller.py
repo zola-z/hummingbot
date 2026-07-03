@@ -7,7 +7,7 @@ class AdaptiveRateController:
     """MSX 自适应限流控制器(配置为主 + AIMD 兜底)。
 
     正常态: 稳定运行在 initial_rps(≈ceiling×0.9), 不主动往上试探 -> 零 429。
-    遇 429/1006: 乘性降速 ×decrease_factor + 记 _probed_ceiling + 进入 cooldown。
+    遇 429: 乘性降速 ×decrease_factor + 记 _probed_ceiling + 进入 cooldown。
     恢复: 平稳期按 recovery_interval 每次 +recovery_step, 上限 min(initial, probed×safety)。
     """
 

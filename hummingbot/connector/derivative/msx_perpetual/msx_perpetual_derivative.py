@@ -125,8 +125,12 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         return self._rate_controller_obj
 
     def _is_rate_limited(self, exc: Exception) -> bool:
-        text = str(exc)
-        return "429" in text or "1006" in text
+        # 只处理 HTTP 429(限流)。用 rest_assistant 的固定模板匹配, 避免误判 URL/body 里含
+        # "429" 的 orderId(int64)/金额/时间戳(如 HTTP 500 body 含 orderId: 84291006)。
+        # MSX 的 code:1006("Request too frequent")是并发下单错误, 已由 order_request_lock
+        # 串行化从源头避免, 且 1006 走 HTTP200+body(SUCCESS_CODES 不含 1006, 由上层
+        # _raise_on_error 才抛)不经此异常路径, 故此处不处理。
+        return "HTTP status is 429" in str(exc)
 
     def _parse_retry_after(self, exc: Exception) -> Optional[float]:
         m = re.search(r"[Rr]etry-?[Aa]fter[\"':\s]+(\d+(?:\.\d+)?)", str(exc))

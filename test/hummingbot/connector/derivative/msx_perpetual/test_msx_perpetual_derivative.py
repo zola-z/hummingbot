@@ -1052,12 +1052,20 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         )
         self.assertIsInstance(self.exchange.rate_controller, AdaptiveRateController)
 
-    def test_is_rate_limited_detects_429_and_1006(self):
+    def test_is_rate_limited_only_matches_http_429_template(self):
+        # 429 用固定模板 "HTTP status is 429" 匹配。
         e429 = OSError("HTTP status is 429. Error: rate limit")
-        e1006 = OSError('HTTP status is 200. Error: {"code":1006,"message":"Request too frequent"}')
-        e_other = OSError("HTTP status is 500. Error: server error")
         self.assertTrue(self.exchange._is_rate_limited(e429))
-        self.assertTrue(self.exchange._is_rate_limited(e1006))
+        # 1006 走 HTTP200+body(_raise_on_error 在上层抛), 且已由 order_request_lock 串行化
+        # 从源头避免, 此处不再识别为限流。
+        e1006 = OSError('HTTP status is 200. Error: {"code":1006,"message":"Request too frequent"}')
+        self.assertFalse(self.exchange._is_rate_limited(e1006))
+        # 防误判: HTTP 500, body 里的 orderId(int64) 恰好嵌了 "429"/"1006" 数字, 不得误判为限流。
+        e_false_positive = OSError(
+            'HTTP status is 500. Error: {"code":500,"message":"server error","orderId":84291006}'
+        )
+        self.assertFalse(self.exchange._is_rate_limited(e_false_positive))
+        e_other = OSError("HTTP status is 500. Error: server error")
         self.assertFalse(self.exchange._is_rate_limited(e_other))
 
     async def test_api_request_retries_on_429_then_succeeds(self):
