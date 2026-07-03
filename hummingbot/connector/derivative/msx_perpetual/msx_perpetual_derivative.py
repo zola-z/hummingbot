@@ -176,8 +176,14 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
         # MSX rejects requests outside the ±30s window with HTTP 401; treat that as a clock issue.
+        # MSX shares HTTP 401 for "缺少鉴权参数 / 时间戳过期 / 签名验证失败 / 无效的 API Key"
+        # (通用响应格式_v1_1) with no dedicated code, so we must disambiguate on the message text.
+        # The real message is Chinese ("时间戳过期"), which does NOT contain the English word
+        # "timestamp" — matching only "timestamp" silently failed to trigger re-sync on clock skew.
         error_description = str(request_exception)
-        return "401" in error_description and "timestamp" in error_description.lower()
+        return "401" in error_description and (
+            "timestamp" in error_description.lower() or "时间戳" in error_description
+        )
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         # _request_order_status raises an IOError tagged with this marker when an order can be found
@@ -328,8 +334,9 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
             self._raise_on_error(order_result)
             transact_time = time.time()
 
-            # v1.1 文档称下单响应返回 data.orderId, 但生产实测(2026-06)仍为 data:null,
-            # 需回查最新订单匹配。若服务端后续修复直接返回 orderId, 此处会优先采用。
+            # 下单响应返回 data.orderId: 2026-06 生产实测仍为 data:null(需回查); 2026-07-02
+            # 复验已修复, 生产稳定返回 data.orderId(实测 orderId=4199244)。正常路径直接采用
+            # 响应 orderId; _resolve_new_order_id 回查仅作服务端偶发不返回时的 fallback。
             data = order_result.get("data") if isinstance(order_result, dict) else None
             if isinstance(data, dict) and data.get("orderId") is not None:
                 return str(data["orderId"]), transact_time

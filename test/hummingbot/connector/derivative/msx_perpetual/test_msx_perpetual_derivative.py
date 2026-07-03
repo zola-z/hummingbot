@@ -1009,6 +1009,41 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         status = await self.exchange.check_network()
         self.assertEqual(NetworkStatus.CONNECTED, status)
 
+    # ---- time-synchronizer error detection ------------------------------------
+
+    def test_clock_skew_401_chinese_message_detected_as_time_sync(self):
+        """MSX 时钟超窗返回 code=401 + 中文 message '时间戳过期'(通用响应格式_v1_1)。
+
+        判定必须识别中文 '时间戳', 否则时钟漂移时 HB 不会触发重新校时, 签名请求
+        持续 401 无法自愈。
+        """
+        exc = OSError(
+            "Error executing request POST /order/create. HTTP status is 401. "
+            'Error: {"code":401,"message":"时间戳过期"}'
+        )
+        self.assertTrue(
+            self.exchange._is_request_exception_related_to_time_synchronizer(exc),
+            "中文 '时间戳过期' 的 401 应被识别为时钟问题",
+        )
+
+    def test_missing_auth_401_not_treated_as_time_sync(self):
+        """'缺少鉴权参数' 的 401 不是时钟问题, 不得触发校时(否则真缺鉴权却去校时)。"""
+        exc = OSError(
+            "Error executing request GET /ticker/BTCUSDT. HTTP status is 401. "
+            'Error: {"code":401,"message":"缺少鉴权参数"}'
+        )
+        self.assertFalse(
+            self.exchange._is_request_exception_related_to_time_synchronizer(exc),
+            "'缺少鉴权参数' 不应被误判为时钟问题",
+        )
+
+    def test_clock_skew_401_english_timestamp_still_detected(self):
+        """向后兼容: 含英文 'timestamp' 的 401 仍应被识别(不回归)。"""
+        exc = OSError('HTTP status is 401. Error: {"message":"timestamp expired"}')
+        self.assertTrue(
+            self.exchange._is_request_exception_related_to_time_synchronizer(exc)
+        )
+
     # ---- helpers --------------------------------------------------------------
 
     def _last_request_body(self, mock_api: aioresponses, url: str) -> str:
