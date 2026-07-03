@@ -157,6 +157,12 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
                         await asyncio.sleep(self._backoff_delay(attempt, retry_after))
                         continue
                 raise
+        # 护栏: 正常配置下(RATE_MAX_RETRIES >= 0)循环体总会 return/raise, 此处不可达。
+        # 但若 RATE_MAX_RETRIES 被误配为 -1, range(0) 是空循环, 会隐式 return None 破坏调用方
+        # (把 None 当成 API 响应)。显式抛错, 让误配立即暴露而非静默返回 None。
+        raise RuntimeError(
+            "unreachable: _api_request retry loop exited without return/raise "
+            f"(RATE_MAX_RETRIES={CONSTANTS.RATE_MAX_RETRIES}?)")
 
     @property
     def name(self) -> str:

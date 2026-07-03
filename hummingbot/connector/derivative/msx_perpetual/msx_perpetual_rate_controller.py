@@ -24,7 +24,8 @@ class AdaptiveRateController:
         time_fn=time.monotonic,
     ):
         self._floor = floor_rps
-        self._ceiling = ceiling_rps
+        # ceiling_rps 仅用于把 initial 夹到硬上限(局部参数即可, 不存字段——effective 的实际上限
+        # 由 _recovery_cap 用 initial/_probed_ceiling 决定, 无处再读 self._ceiling)。
         self._initial = min(initial_rps, ceiling_rps)
         self._decrease_factor = decrease_factor
         self._safety_factor = safety_factor
@@ -73,10 +74,15 @@ class AdaptiveRateController:
     async def acquire(self) -> None:
         self._maybe_recover()
         min_interval = 1.0 / self._effective_rps if self._effective_rps > 0 else 0.0
-        wait = self._last_grant_ts + min_interval - self._now()
+        now = self._now()
+        # 令牌桶预约: 计算"我的"grant 时刻并在 await 之前就把 _last_grant_ts 推进到它(占位)。
+        # 这样 N 个并发 acquire 会各自预约到 t0, t0+interval, t0+2*interval... 错开放行,
+        # 而不是全部读到同一 _last_grant_ts、算出同一 wait、同睡同醒挤成一个 burst 绕过节流。
+        grant_at = max(now, self._last_grant_ts + min_interval)
+        self._last_grant_ts = grant_at
+        wait = grant_at - now
         if wait > 0:
             await asyncio.sleep(wait)
-        self._last_grant_ts = self._now()
 
     def snapshot(self) -> dict:
         return {

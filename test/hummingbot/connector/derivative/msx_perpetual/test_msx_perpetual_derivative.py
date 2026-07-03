@@ -1118,6 +1118,37 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             base_mod.ExchangePyBase._api_request = orig
             der_mod.asyncio.sleep = orig_sleep
 
+    async def test_api_request_guardrail_never_returns_none_on_empty_retry_loop(self):
+        # 护栏: 若 RATE_MAX_RETRIES 被误配为 -1, range(0) 是空循环, 旧代码会隐式 return None
+        # 破坏调用方(把 None 当成 API 响应)。护栏必须改为抛 RuntimeError, 而不是静默返回 None。
+        import hummingbot.connector.derivative.msx_perpetual.msx_perpetual_derivative as der_mod
+        orig_retries = CONSTANTS.RATE_MAX_RETRIES
+        CONSTANTS.RATE_MAX_RETRIES = -1  # range(-1 + 1) == range(0) -> 空循环
+        try:
+            with self.assertRaises(RuntimeError):
+                await self.exchange._api_request(path_url="/x", is_auth_required=True)
+        finally:
+            CONSTANTS.RATE_MAX_RETRIES = orig_retries
+        del der_mod
+
+    # ---- vendored coupling contract ------------------------------------------
+
+    def test_vendored_rest_assistant_still_uses_http_status_is_template(self):
+        # _is_rate_limited 依赖 vendored rest_assistant 抛 IOError 时的固定文本
+        # "HTTP status is {status}". 若 HB 内核升级改了这段措辞, 429 检测会静默失效。
+        # 断言该模板仍存在于源码, 以便升级时 CI 立刻报警(而非线上限流后才发现)。
+        import inspect
+
+        from hummingbot.core.web_assistant import rest_assistant
+        source = inspect.getsource(rest_assistant)
+        self.assertIn("HTTP status is", source)
+
+    def test_is_rate_limited_contract_429_true_500_false(self):
+        # 最小契约: 对 "HTTP status is 429" 返回 True, 对 "HTTP status is 500" 返回 False。
+        # 与上面的模板存在性测试成对, 锁定 _is_rate_limited 对 vendored 文本的耦合。
+        self.assertTrue(self.exchange._is_rate_limited(OSError("HTTP status is 429.")))
+        self.assertFalse(self.exchange._is_rate_limited(OSError("HTTP status is 500.")))
+
     # ---- helpers --------------------------------------------------------------
 
     def _last_request_body(self, mock_api: aioresponses, url: str) -> str:
