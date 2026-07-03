@@ -1044,6 +1044,72 @@ class MsxPerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             self.exchange._is_request_exception_related_to_time_synchronizer(exc)
         )
 
+    # ---- adaptive rate limit (G4) ---------------------------------------------
+
+    def test_rate_controller_property_exists(self):
+        from hummingbot.connector.derivative.msx_perpetual.msx_perpetual_rate_controller import (
+            AdaptiveRateController,
+        )
+        self.assertIsInstance(self.exchange.rate_controller, AdaptiveRateController)
+
+    def test_is_rate_limited_detects_429_and_1006(self):
+        e429 = OSError("HTTP status is 429. Error: rate limit")
+        e1006 = OSError('HTTP status is 200. Error: {"code":1006,"message":"Request too frequent"}')
+        e_other = OSError("HTTP status is 500. Error: server error")
+        self.assertTrue(self.exchange._is_rate_limited(e429))
+        self.assertTrue(self.exchange._is_rate_limited(e1006))
+        self.assertFalse(self.exchange._is_rate_limited(e_other))
+
+    async def test_api_request_retries_on_429_then_succeeds(self):
+        calls = {"n": 0}
+
+        async def fake_super(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("HTTP status is 429. Error: rate limit")
+            return {"code": 0, "msg": "success", "data": {}}
+
+        # patch the base-class _api_request the override delegates to
+        import hummingbot.connector.exchange_py_base as base_mod
+        orig = base_mod.ExchangePyBase._api_request
+        base_mod.ExchangePyBase._api_request = fake_super
+        # avoid real sleeps
+        import hummingbot.connector.derivative.msx_perpetual.msx_perpetual_derivative as der_mod
+        orig_sleep = der_mod.asyncio.sleep
+
+        async def no_sleep(_):
+            return None
+
+        der_mod.asyncio.sleep = no_sleep
+        try:
+            result = await self.exchange._api_request(path_url="/x", is_auth_required=True)
+        finally:
+            base_mod.ExchangePyBase._api_request = orig
+            der_mod.asyncio.sleep = orig_sleep
+        self.assertEqual(2, calls["n"])
+        self.assertEqual({"code": 0, "msg": "success", "data": {}}, result)
+
+    async def test_api_request_reraises_after_retries_exhausted(self):
+        async def always_429(*args, **kwargs):
+            raise OSError("HTTP status is 429. Error: rate limit")
+
+        import hummingbot.connector.exchange_py_base as base_mod
+        orig = base_mod.ExchangePyBase._api_request
+        base_mod.ExchangePyBase._api_request = always_429
+        import hummingbot.connector.derivative.msx_perpetual.msx_perpetual_derivative as der_mod
+        orig_sleep = der_mod.asyncio.sleep
+
+        async def no_sleep(_):
+            return None
+
+        der_mod.asyncio.sleep = no_sleep
+        try:
+            with self.assertRaises(OSError):
+                await self.exchange._api_request(path_url="/x", is_auth_required=True)
+        finally:
+            base_mod.ExchangePyBase._api_request = orig
+            der_mod.asyncio.sleep = orig_sleep
+
     # ---- helpers --------------------------------------------------------------
 
     def _last_request_body(self, mock_api: aioresponses, url: str) -> str:

@@ -1,4 +1,6 @@
 import asyncio
+import random
+import re
 import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -15,6 +17,9 @@ from hummingbot.connector.derivative.msx_perpetual.msx_perpetual_api_order_book_
     MsxPerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.msx_perpetual.msx_perpetual_auth import MsxPerpetualAuth
+from hummingbot.connector.derivative.msx_perpetual.msx_perpetual_rate_controller import (
+    AdaptiveRateController,
+)
 from hummingbot.connector.derivative.msx_perpetual.msx_perpetual_user_stream_data_source import (
     MsxPerpetualUserStreamDataSource,
 )
@@ -94,6 +99,7 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         # Symbols whose list fetch failed this cycle: their lookups must fall back to per-order queries
         # rather than treating a snapshot miss as "order gone" (which would wrongly fire not-found).
         self._order_status_cache_failed_symbols: Set[str] = set()
+        self._rate_controller_obj: Optional[AdaptiveRateController] = None
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -102,6 +108,51 @@ class MsxPerpetualDerivative(PerpetualDerivativePyBase):
         if self._order_request_lock is None:
             self._order_request_lock = asyncio.Lock()
         return self._order_request_lock
+
+    @property
+    def rate_controller(self) -> AdaptiveRateController:
+        if self._rate_controller_obj is None:
+            self._rate_controller_obj = AdaptiveRateController(
+                floor_rps=CONSTANTS.RATE_FLOOR_RPS,
+                ceiling_rps=CONSTANTS.RATE_CEILING_RPS,
+                initial_rps=CONSTANTS.RATE_INITIAL_RPS,
+                decrease_factor=CONSTANTS.RATE_DECREASE_FACTOR,
+                safety_factor=CONSTANTS.RATE_SAFETY_FACTOR,
+                recovery_step=CONSTANTS.RATE_RECOVERY_STEP,
+                recovery_interval_s=CONSTANTS.RATE_RECOVERY_INTERVAL_S,
+                cooldown_s=CONSTANTS.RATE_COOLDOWN_S,
+            )
+        return self._rate_controller_obj
+
+    def _is_rate_limited(self, exc: Exception) -> bool:
+        text = str(exc)
+        return "429" in text or "1006" in text
+
+    def _parse_retry_after(self, exc: Exception) -> Optional[float]:
+        m = re.search(r"[Rr]etry-?[Aa]fter[\"':\s]+(\d+(?:\.\d+)?)", str(exc))
+        return float(m.group(1)) if m else None
+
+    def _backoff_delay(self, attempt: int, retry_after: Optional[float]) -> float:
+        if retry_after is not None:
+            return retry_after
+        base = min(CONSTANTS.RATE_BACKOFF_BASE_S * (2 ** attempt), CONSTANTS.RATE_BACKOFF_CAP_S)
+        return base + random.uniform(0.0, CONSTANTS.RATE_BACKOFF_JITTER_S)
+
+    async def _api_request(self, *args, **kwargs):
+        for attempt in range(CONSTANTS.RATE_MAX_RETRIES + 1):
+            await self.rate_controller.acquire()
+            try:
+                result = await super()._api_request(*args, **kwargs)
+                self.rate_controller.on_success()
+                return result
+            except IOError as e:
+                if self._is_rate_limited(e):
+                    retry_after = self._parse_retry_after(e)
+                    self.rate_controller.on_429(retry_after)
+                    if attempt < CONSTANTS.RATE_MAX_RETRIES:
+                        await asyncio.sleep(self._backoff_delay(attempt, retry_after))
+                        continue
+                raise
 
     @property
     def name(self) -> str:

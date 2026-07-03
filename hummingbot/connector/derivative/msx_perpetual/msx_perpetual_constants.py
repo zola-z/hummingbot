@@ -170,6 +170,21 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(LIMIT_ID_PRIVATE), LinkedLimitWeightPair("PRIVATE_RPS")]),
 ]
 
+# --- Adaptive rate control (G4) --------------------------------------------
+# 配置为主 + AIMD 兜底。现实 ~10 rps; MSX 放开做市商档后改 CEILING=100/INITIAL=90。
+RATE_CEILING_RPS = 10.0
+RATE_INITIAL_RPS = 9.0
+RATE_FLOOR_RPS = 2.0
+RATE_DECREASE_FACTOR = 0.7
+RATE_SAFETY_FACTOR = 0.9
+RATE_RECOVERY_STEP = 1.0
+RATE_RECOVERY_INTERVAL_S = 1.0
+RATE_COOLDOWN_S = 2.0
+RATE_MAX_RETRIES = 3
+RATE_BACKOFF_BASE_S = 0.5
+RATE_BACKOFF_CAP_S = 8.0
+RATE_BACKOFF_JITTER_S = 0.25
+
 # 成功码: v1.1 起所有接口(公共+私有)统一返回 code==0 (实测生产 2026-06 全部为 0)。
 # 旧版私有接口曾返回 200; 集合同时容忍 200 以兼容过渡期/历史数据。
 SUCCESS_CODE = 0
