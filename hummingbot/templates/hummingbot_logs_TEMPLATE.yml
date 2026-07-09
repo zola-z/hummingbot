@@ -1,6 +1,6 @@
 ---
 version: 1
-template_version: 12
+template_version: 13
 
 formatters:
     simple:
@@ -75,6 +75,17 @@ loggers:
         level: NETWORK
         handlers: ["null"]
         propagate: false
+        mqtt: false
+    # NMMMS 策略代码(engine.*)日志。必须显式声明: headless 启动会调用 init_logging 两次
+    # (quick_start 一次、run_application 再一次), 而第二次 dictConfig 默认
+    # disable_existing_loggers=True — 此时 engine.* logger 已在首次 strategy 加载时创建,
+    # 若不在配置中显式命名(或祖先被命名), 会被整体 disable, 导致 "config hot-updated"/
+    # "RISK HALT received" 等确认日志静默消失(曾被误判为 pub/sub 消费失效)。命名顶层
+    # 包 engine 即可保护所有 engine.* 子 logger 不被 disable。
+    engine:
+        level: INFO
+        propagate: false
+        handlers: [console, file_handler]
         mqtt: false
 
 root:
